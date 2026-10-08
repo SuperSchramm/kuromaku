@@ -74,11 +74,15 @@ returnCodes2Ignore="301,302,303,304,307,400,404,429,500,501,502,503,504"
 # ─── Resolve prefix and input files ────────────────────────────────────────────
 if [ -n "${cidr_input:-}" ]; then
   # Same prefix-derivation as phase-network.sh's CIDR mode — must match so
-  # this phase finds the unique-ips.log that network already produced.
-  if [ -f "$cidr_input" ]; then
-    raw_prefix="$(basename "$cidr_input")"
-  else
+  # this phase finds the unique-ips.log that network already produced. Derive
+  # from the target's SHAPE (bare IP/CIDR -> raw; otherwise -> basename), not
+  # from file existence, so the two phases agree even if the list file isn't
+  # mounted this time. Mirrors the orchestrator's cidrPrefix().
+  is_ip_or_cidr() { printf '%s' "$1" | grep -qE '^([0-9]{1,3}\.){3}[0-9]{1,3}(/[0-9]{1,2})?$'; }
+  if is_ip_or_cidr "$cidr_input"; then
     raw_prefix="$cidr_input"
+  else
+    raw_prefix="$(basename "$cidr_input")"
   fi
   TARGET_PREFIX="$tdir/$(echo "$raw_prefix" | tr '/.' '_-')"
 elif [ -z "${domain_list:-}" ]; then

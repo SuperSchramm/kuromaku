@@ -58,16 +58,34 @@ portsIcareAbout="80,443,21,22,23,3306,8080,8443,8000,8888,9090,9443"
 ## CIDR/IP per line. naabu accepts CIDR/IP/file natively via -list or -host —
 ## no dnsx resolution step needed (there are no hostnames to resolve).
 if [ -n "${cidr_input:-}" ]; then
-  # Prefix derived from the CIDR/file for output filenames, e.g.
-  # "206.130.144.0_24" or basename of a provided file.
-  if [ -f "$cidr_input" ]; then
-    raw_prefix="$(basename "$cidr_input")"
-    NAABU_INPUT_ARGS=(-list "$cidr_input")
-  else
+  # True for a bare IPv4 or IPv4 CIDR (e.g. 10.0.0.5 or 206.130.144.0/24).
+  is_ip_or_cidr() { printf '%s' "$1" | grep -qE '^([0-9]{1,3}\.){3}[0-9]{1,3}(/[0-9]{1,2})?$'; }
+
+  # Output-file prefix MUST match the orchestrator's cidrPrefix(): the raw
+  # string for a bare IP/CIDR, the basename for a file-path target. Derive it
+  # from the target's SHAPE, not from whether the file currently exists —
+  # otherwise a missing/mis-mounted list shifts every output name to the
+  # full-path form and the orchestrator reports "missing expected outputs" for
+  # files that were in fact written.
+  if is_ip_or_cidr "$cidr_input"; then
     raw_prefix="$cidr_input"
-    NAABU_INPUT_ARGS=(-host "$cidr_input")
+  else
+    raw_prefix="$(basename "$cidr_input")"
   fi
   TARGET_PREFIX="$tdir/$(echo "$raw_prefix" | tr '/.' '_-')"
+
+  # naabu input mode is a separate decision: a real file -> -list; a bare
+  # IP/CIDR -> -host. A path-shaped target that isn't present under
+  # /workspace/scans is almost certainly a caller mistake (pass `ips` or place
+  # the file in the scan dir) — warn loudly rather than scan a literal path.
+  if [ -f "$cidr_input" ]; then
+    NAABU_INPUT_ARGS=(-list "$cidr_input")
+  elif is_ip_or_cidr "$cidr_input"; then
+    NAABU_INPUT_ARGS=(-host "$cidr_input")
+  else
+    log "WARNING: target '$cidr_input' is neither a file in /workspace/scans nor a bare IP/CIDR — nothing to scan. Pass targets via the ips array or place the list in the scan dir."
+    NAABU_INPUT_ARGS=(-host "$cidr_input")
+  fi
 
   log "Phase started (CIDR mode: ${cidr_input})"
 
