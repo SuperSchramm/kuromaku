@@ -357,8 +357,15 @@ export async function runPipeline(scanDir, opts) {
 // ─── Stop a running phase ────────────────────────────────────────────────────
 export function stopPhase(scanDir) {
   const checkpoint = cp.readCheckpoint(scanDir);
-  for (const phase of cp.PHASE_ORDER) {
+  // Mode-aware: a CIDR checkpoint only has network+webscan phases. Iterating the
+  // 5-phase domain order would hit checkpoint.phases.recon === undefined and
+  // throw on `.status` before ever reaching the running phase — which is why
+  // kuromaku_stop silently failed on IP/CIDR scans. The `if (!p) continue` guard
+  // keeps it safe even if the two ever drift again.
+  const order = checkpoint.mode === "cidr" ? CIDR_PHASE_ORDER : cp.PHASE_ORDER;
+  for (const phase of order) {
     const p = checkpoint.phases[phase];
+    if (!p) continue;
     if (p.status === "running" && p.container_id) {
       try {
         execSync(`docker kill ${p.container_id} 2>/dev/null`);
