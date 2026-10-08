@@ -24,6 +24,15 @@ the only things that make sense against a bare IP. `kuromaku_run` also
 auto-detects an IP/CIDR passed as `domain` and transparently routes here
 instead of running the domain pipeline against it.
 
+**Scanning many IPs — use the `ips` array.** For a list of targets, pass them
+inline via `kuromaku_ip_scan`'s `ips` array (`["10.0.0.5", "206.130.144.0/24", …]`),
+*not* a made-up file path in `cidr`. The orchestrator writes the list into the
+scan directory — the one path that's actually bind-mounted into the worker
+containers — so naabu/nmap can read it. A host path handed to `cidr` that the
+orchestrator can't see is the classic "scanned 1200 IPs, found 0" failure; the
+`ips` array sidesteps it entirely. (`cidr` still accepts a single IP/CIDR, or a
+file path that already exists on the orchestrator's filesystem.)
+
 ## Directory layout
 
 ```

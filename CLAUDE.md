@@ -40,6 +40,17 @@ structural changes.
 - IP/CIDR targets skip all hostname-dependent tools entirely (no amass/
   subfinder/gau/nuclei/dirsearch) — this is intentional, not a gap to "fix"
   by trying to run them anyway.
+- Multi-target IP scans come in via `kuromaku_ip_scan`'s `ips` **array**, not a
+  file path. The workers only see `<scanDir>:/workspace/scans`, so a host file
+  path handed to `--cidr` is invisible inside the container — that was the
+  "scanned a 1200-IP list, found 0 IPs" bug. The orchestrator now writes `ips`
+  (or a real, orchestrator-visible file passed as `cidr`) into the scan dir as
+  `ip-targets.txt` and hands the worker the container path. Keep the three
+  pieces in sync if you touch this: `runIpScan`/`launchCidrPipeline` in
+  `index.js` (writes the list, passes the container path), `cidrPrefix` in
+  `orchestrator.js` (basename-vs-string rule must match the worker), and
+  `phase-network.sh`'s CIDR branch (copies the file's *contents* into
+  `unique-ips.log`, never the path string).
 - Nuclei runs in resource-capped batches (3 tag groups), each with its own
   heartbeat + `-stats` output piped into the progress log — do not revert to
   one unbatched run; it caused a full system lockup once on constrained

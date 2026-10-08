@@ -171,14 +171,22 @@ const TOOL_LIST = [
       "pipeline: network (naabu port scan) -> webscan (nmap service/version " +
       "detection, vulners script). No hostname-based steps (recon/dirsearch/" +
       "nuclei/xss) — this is IP-space only. Creates its own lightweight " +
-      "checkpoint; use kuromaku_status with the same project_name to monitor.",
+      "checkpoint; use kuromaku_status with the same project_name to monitor. " +
+      "To scan MANY targets, pass them inline via `ips` — do NOT invent a file " +
+      "path for `cidr`, since a host path isn't visible inside the worker " +
+      "containers unless the orchestrator places it there for you.",
     inputSchema: {
       type: "object",
       properties: {
-        cidr: { type: "string", description: "CIDR (206.130.144.0/24), single IP, or path to a file with one CIDR/IP per line" },
+        ips: {
+          type: "array",
+          items: { type: "string" },
+          description: "Preferred for multi-target scans: an array of IPs/CIDRs (one target per element, e.g. [\"10.0.0.5\", \"206.130.144.0/24\"]). The orchestrator writes these into the scan dir so the workers can read them. Use this instead of pointing `cidr` at a file path you made up.",
+        },
+        cidr: { type: "string", description: "A single CIDR (206.130.144.0/24), a single IP, or the path to an EXISTING file (readable by the orchestrator) with one CIDR/IP per line. For many targets prefer `ips`." },
         project_name: { type: "string", description: "Project folder name (required — used for output file naming and checkpoint)" },
       },
-      required: ["cidr", "project_name"],
+      required: ["project_name"],
     },
   },
   {
@@ -215,7 +223,7 @@ function findPrefix(scanDir, cpData) {
 // `redirected` just changes the returned message so it's clear to the caller
 // (human or LLM) why a "run" request ended up on the 2-phase IP pipeline
 // instead of the 5-phase domain pipeline.
-function runIpScan(cidr, projectNameRaw, redirected) {
+function runIpScan(cidr, projectNameRaw, redirected, ips) {
   const projectName = projectNameRaw.replace(/[^a-zA-Z0-9_-]/g, "-");
   ensureProjectDirs(projectName);
   const scanDir = scanDirFor(projectName);
@@ -229,9 +237,29 @@ function runIpScan(cidr, projectNameRaw, redirected) {
   // path — otherwise `[ -f "$cidr_input" ]` is false in the worker, the path
   // string gets treated as a single host, and naabu/nmap scan nothing (the
   // "found 0 IPs for a 1200-IP list" bug).
+  let execTarget;        // what the worker containers receive via --cidr
+  let displayTarget;     // what we show the user / store as checkpoint `domain`
+
+  // Preferred path for multi-target scans: an inline `ips` array. We write it
+  // straight into the scan dir (the one mount the workers can see) and hand
+  // them the container-internal path — no host file path to guess, no mount
+  // surprises. This is the documented, correct way for an LLM caller to pass
+  // a list of IPs.
+  if (Array.isArray(ips) && ips.length > 0) {
+    const cleaned = ips.map((x) => String(x).trim()).filter((x) => x && !x.startsWith("#"));
+    if (cleaned.length === 0) {
+      return { content: [{ type: "text", text: "`ips` was provided but contained no usable IP/CIDR entries." }] };
+    }
+    const destName = "ip-targets.txt";
+    fs.writeFileSync(path.join(scanDir, destName), cleaned.join("\n") + "\n");
+    execTarget = `/workspace/scans/${destName}`;
+    displayTarget = `${cleaned.length} target(s) (inline ips list)`;
+    return launchCidrPipeline(scanDir, projectName, execTarget, displayTarget, redirected);
+  }
+
   const cidrStr = String(cidr).trim();
-  let execTarget = cidrStr;        // what the worker containers receive via --cidr
-  let displayTarget = cidrStr;     // what we show the user / store as checkpoint `domain`
+  execTarget = cidrStr;
+  displayTarget = cidrStr;
   if (!isIpOrCidr(cidrStr)) {
     if (!fs.existsSync(cidrStr)) {
       return { content: [{ type: "text", text:
@@ -257,6 +285,13 @@ function runIpScan(cidr, projectNameRaw, redirected) {
     }
   }
 
+  return launchCidrPipeline(scanDir, projectName, execTarget, displayTarget, redirected);
+}
+
+// Shared tail of runIpScan: create/validate the checkpoint, kick off the CIDR
+// pipeline, and build the user-facing status message. execTarget is the
+// worker-visible target (--cidr); displayTarget is the human-readable label.
+function launchCidrPipeline(scanDir, projectName, execTarget, displayTarget, redirected) {
   if (!cp.checkpointExists(scanDir)) {
     // Store execTarget in options.cidr (the pipeline + resume read it); keep
     // displayTarget as the human-facing `domain` field.
@@ -310,7 +345,13 @@ async function handleToolCall(name, args) {
 
   // ── kuromaku_ip_scan ─────────────────────────────────────────────────────────
   if (name === "kuromaku_ip_scan") {
-    return runIpScan(args.cidr, args.project_name, false);
+    if (!args.project_name) {
+      return { content: [{ type: "text", text: "project_name is required." }] };
+    }
+    if (!args.cidr && !(Array.isArray(args.ips) && args.ips.length > 0)) {
+      return { content: [{ type: "text", text: "Provide either `ips` (an array of IPs/CIDRs — preferred for lists) or `cidr` (a single IP/CIDR or an existing file path)." }] };
+    }
+    return runIpScan(args.cidr, args.project_name, false, args.ips);
   }
 
   // ── kuromaku_list_projects ──────────────────────────────────────────────────
