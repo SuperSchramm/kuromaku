@@ -197,21 +197,63 @@ else
 fi
 
 # ─── Nmap Vulners Scan ───────────────────────────────────────────────────────────
+## Service/vuln-scan ONLY what naabu already found open, not every port on every
+## host. naabu is the port scanner; feeding nmap its open host:port set turns a
+## (hosts × ~1000 default ports) -Pn sweep — which takes hours-to-days and
+## emits endless "RTTVAR has grown" timing backoffs on large/filtered ranges —
+## into (open hosts × the few open ports). Falls back to the full unique-ips
+## list only if naabu produced nothing. --host-timeout bounds any single stuck
+## host; --stats-every streams real progress (% done, ETA) into the progress log.
 log "Nmap vulnerability scan"
-IP_COUNT=$(wc -l < "$UNIQUE_IPS_FILE" 2>/dev/null || echo 0)
-if [ "$IP_COUNT" -gt 0 ]; then
+NAABU_FILE="$TARGET_PREFIX-naabu.log"
+NMAP_HOSTS_FILE="$TARGET_PREFIX-nmap-hosts.txt"
+NMAP_PORTS=""
+if [ -s "$NAABU_FILE" ]; then
+  cut -d: -f1 "$NAABU_FILE" | sort -u > "$NMAP_HOSTS_FILE"
+  NMAP_PORTS=$(cut -d: -f2 "$NAABU_FILE" | grep -E '^[0-9]+$' | sort -un | paste -sd, -)
+else
+  # No naabu hits — fall back to the raw target list (bounded by --host-timeout).
+  cp "$UNIQUE_IPS_FILE" "$NMAP_HOSTS_FILE" 2>/dev/null || : > "$NMAP_HOSTS_FILE"
+fi
+HOST_COUNT=$(wc -l < "$NMAP_HOSTS_FILE" 2>/dev/null || echo 0)
+
+if [ "$HOST_COUNT" -gt 0 ]; then
+  if [ -n "$NMAP_PORTS" ]; then
+    PORT_ARGS=(-p "$NMAP_PORTS")
+    log "Scoping nmap to naabu results: $HOST_COUNT host(s), ports $NMAP_PORTS"
+  else
+    PORT_ARGS=()
+    log "No naabu port data — nmap default ports on $HOST_COUNT host(s)"
+  fi
+
+  # Heartbeat so the progress log never goes silent even if nmap's own stats stall.
+  ( while true; do
+      sleep 60
+      echo " █▄▄▪ [webscan] heartbeat — nmap still running ($HOST_COUNT hosts), $(date +%H:%M:%S)" >> "$PROGRESS_LOG"
+    done ) &
+  NMAP_HEARTBEAT_PID=$!
+
+  # -oN writes the report to the file; stdout (incl. --stats-every progress) is
+  # tagged into the progress log for live visibility.
   nmap -sV --script vulners \
        --open \
        -Pn \
        -T4 \
        --min-parallelism 10 \
+       --host-timeout 5m \
+       --stats-every 30s \
+       "${PORT_ARGS[@]}" \
        --dns-servers "$DOCKER_DNS" \
-       -iL "$UNIQUE_IPS_FILE" \
-       | tee "$TARGET_PREFIX-nmapvulners.log" > /dev/null
+       -oN "$TARGET_PREFIX-nmapvulners.log" \
+       -iL "$NMAP_HOSTS_FILE" 2>&1 \
+    | sed "s/^/ █▄▄▪ [webscan] [nmap] /" >> "$PROGRESS_LOG"
+
+  kill "$NMAP_HEARTBEAT_PID" 2>/dev/null
+  wait "$NMAP_HEARTBEAT_PID" 2>/dev/null
   log "Output: $TARGET_PREFIX-nmapvulners.log"
 else
-  log "No IPs resolved — skipping nmap"
-  echo "# No IPs to scan" > "$TARGET_PREFIX-nmapvulners.log"
+  log "No hosts to scan — skipping nmap"
+  echo "# No hosts to scan" > "$TARGET_PREFIX-nmapvulners.log"
 fi
 
 # ─── Dirsearch Brute Force ────────────────────────────────────────────────────────
