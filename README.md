@@ -65,7 +65,8 @@ kuromaku/
 | `kuromaku_status` | Read checkpoint status for a project (runs stale-detection) |
 | `kuromaku_pause` / `kuromaku_resume` | Pause after the current phase completes / resume from first pending phase |
 | `kuromaku_stop` | Kill the in-flight container, mark phase failed |
-| `kuromaku_results` | Read output files from a project's scan directory |
+| `kuromaku_results` | Summary of line counts, or the contents of a single output file |
+| `kuromaku_report` | Full report of every output file that HAS DATA (empties omitted); inline, or `export:true` writes `<prefix>-results-report.md` to the scan volume |
 | `kuromaku_new_project` / `kuromaku_list_projects` | Project housekeeping |
 
 Full setup — Docker image builds, `HOST_PROJECTS_DIR`, LM Studio/Claude

@@ -152,6 +152,24 @@ const TOOL_LIST = [
     },
   },
   {
+    name: "kuromaku_report",
+    description:
+      "Assemble a FULL results report for a project — concatenates every output " +
+      "file that HAS DATA, in scan order, with a labeled section per file. Empty " +
+      "or not-yet-produced files are omitted entirely. Returns the report inline " +
+      "by default; with export:true it is instead written to the scan volume as " +
+      "<prefix>-results-report.md (prefer this for large scans, e.g. big nmap " +
+      "output). Use kuromaku_results for the quick line-count summary or a single file.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        project_name: { type: "string" },
+        export: { type: "boolean", description: "Write the report to the scan directory as <prefix>-results-report.md instead of returning it inline. Recommended for large scans." },
+      },
+      required: ["project_name"],
+    },
+  },
+  {
     name: "kuromaku_new_project",
     description: "Create a new bug bounty project folder structure (without starting a scan).",
     inputSchema: {
@@ -226,6 +244,59 @@ function findPrefix(scanDir, cpData) {
   return cpData.options.domain_list
     ? path.basename(cpData.options.domain_list)
     : cpData.domain;
+}
+
+// Single source of truth for a project's output filenames (keyed by the names
+// exposed through kuromaku_results `file` and used by kuromaku_report).
+function outputFileMap(prefix) {
+  return {
+    resolved: `${prefix}-resolved.log`,
+    uniqdomains: `${prefix}-uniqdomains.log`,
+    uniqueips: `${prefix}-unique-ips.log`,
+    naabu: `${prefix}-naabu.log`,
+    nmapvulners: `${prefix}-nmapvulners.log`,
+    nucleiAlerts: `${prefix}-nucleiAlerts.log`,
+    dirsearch: `${prefix}-dirsearch.log`,
+    dalfox: `${prefix}-dalfox.log`,
+    report: `${prefix}-report.docx`,
+  };
+}
+
+// Human-readable section headings for the assembled report.
+const FILE_LABELS = {
+  resolved: "DNS Resolution",
+  uniqdomains: "Unique Subdomains",
+  uniqueips: "Unique IPs",
+  naabu: "Open Ports (naabu)",
+  nmapvulners: "Service & Vulnerability Detection (nmap + vulners)",
+  nucleiAlerts: "Nuclei Findings",
+  dirsearch: "Directory Brute-force (dirsearch)",
+  dalfox: "Reflected-XSS Candidates (dalfox)",
+  report: "DOCX Report",
+};
+
+// Walk the output files for a project and split them into sections that have
+// data vs. files that are empty/absent. The binary DOCX report is referenced
+// by path rather than inlined.
+function assembleReport(scanDir, prefix) {
+  const fileMap = outputFileMap(prefix);
+  const included = [];
+  const skipped = [];
+  for (const [key, fname] of Object.entries(fileMap)) {
+    const full = path.join(scanDir, fname);
+    if (!fs.existsSync(full)) { skipped.push(key); continue; }
+    if (key === "report") {
+      const size = fs.statSync(full).size;
+      if (size > 0) included.push({ key, note: `DOCX report: ${fname} (${size} bytes) — open on the host.` });
+      else skipped.push(key);
+      continue;
+    }
+    const content = fs.readFileSync(full, "utf-8");
+    const count = content.split("\n").filter((l) => l.trim()).length;
+    if (count === 0) { skipped.push(key); continue; }
+    included.push({ key, count, content: content.replace(/\s+$/, "") });
+  }
+  return { fileMap, included, skipped };
 }
 
 // Shared by kuromaku_ip_scan and kuromaku_run's IP/CIDR auto-redirect below.
@@ -546,17 +617,7 @@ async function handleToolCall(name, args) {
     const prefix = findPrefix(scanDir, checkpoint);
     const maxLines = args.max_lines || 100;
 
-    const fileMap = {
-      uniqdomains: `${prefix}-uniqdomains.log`,
-      uniqueips: `${prefix}-unique-ips.log`,
-      naabu: `${prefix}-naabu.log`,
-      nucleiAlerts: `${prefix}-nucleiAlerts.log`,
-      dirsearch: `${prefix}-dirsearch.log`,
-      nmapvulners: `${prefix}-nmapvulners.log`,
-      dalfox: `${prefix}-dalfox.log`,
-      resolved: `${prefix}-resolved.log`,
-      report: `${prefix}-report.docx`,
-    };
+    const fileMap = outputFileMap(prefix);
 
     if (args.file) {
       const fname = fileMap[args.file];
@@ -591,6 +652,56 @@ async function handleToolCall(name, args) {
       }
     }
     return { content: [{ type: "text", text: out.join("\n") }] };
+  }
+
+  // ── kuromaku_report ───────────────────────────────────────────────────
+  if (name === "kuromaku_report") {
+    const scanDir = scanDirFor(args.project_name);
+    if (!cp.checkpointExists(scanDir)) {
+      return { content: [{ type: "text", text: `No checkpoint found for '${args.project_name}'.` }] };
+    }
+    const checkpoint = cp.readCheckpoint(scanDir);
+    const prefix = findPrefix(scanDir, checkpoint);
+    const { included, skipped } = assembleReport(scanDir, prefix);
+
+    const lines = [
+      `# Kuromaku Results Report — ${args.project_name}`,
+      ``,
+      `- Mode: ${checkpoint.mode || "domain"}`,
+      `- Target: ${checkpoint.domain}`,
+      `- Generated: ${new Date().toISOString()}`,
+      ``,
+    ];
+
+    if (included.length === 0) {
+      lines.push(`_No output files contain data yet._`);
+    } else {
+      for (const sec of included) {
+        const label = FILE_LABELS[sec.key] || sec.key;
+        lines.push(`## ${label}${sec.count ? ` — ${sec.count} lines` : ``}`, ``);
+        if (sec.note) {
+          lines.push(sec.note, ``);
+        } else {
+          lines.push("```", sec.content, "```", ``);
+        }
+      }
+      lines.push(`---`, `_Omitted (empty or not produced): ${skipped.join(", ") || "none"}_`);
+    }
+
+    const reportText = lines.join("\n");
+
+    if (args.export) {
+      const outName = `${prefix}-results-report.md`;
+      fs.writeFileSync(path.join(scanDir, outName), reportText + "\n");
+      return { content: [{ type: "text", text:
+        `Full report written to the scan volume: ${outName}\n` +
+        `Path: ${path.join(scanDir, outName)}\n\n` +
+        `Sections with data: ${included.map((s) => s.key).join(", ") || "none"}\n` +
+        `Omitted (empty / not produced): ${skipped.join(", ") || "none"}`,
+      }] };
+    }
+
+    return { content: [{ type: "text", text: reportText }] };
   }
 
   return { content: [{ type: "text", text: `Unknown tool: ${name}` }] };
