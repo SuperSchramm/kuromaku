@@ -21,8 +21,32 @@ import * as orch from "./orchestrator.js";
 
 const PROJECTS_DIR = process.env.PROJECTS_DIR || "/workspace/projects";
 
+// Staging folder for large target lists. A caller (or LLM) drops a file with
+// one IP/CIDR per line here, then passes just its name via ips_file — far more
+// reliable than inlining ~1000 entries in an `ips` array, which the model
+// truncates mid-generation. Created unconditionally so it always exists.
+const INCOMING_DIR = path.join(PROJECTS_DIR, "_incoming");
+try { fs.mkdirSync(INCOMING_DIR, { recursive: true }); } catch { /* best effort */ }
+
 function scanDirFor(projectName) {
   return path.join(PROJECTS_DIR, projectName, "scans");
+}
+
+// Resolve an ips_file reference to an orchestrator-visible path. Accepts an
+// absolute/relative path as given, or a bare filename looked up (in order) in
+// the _incoming staging dir, the project's own scan dir, then PROJECTS_DIR.
+// Returns the first existing path, or null with the list of places searched.
+function resolveIpsFile(ref, scanDir) {
+  const candidates = [
+    ref,
+    path.join(INCOMING_DIR, path.basename(ref)),
+    path.join(scanDir, path.basename(ref)),
+    path.join(PROJECTS_DIR, path.basename(ref)),
+  ];
+  for (const c of candidates) {
+    try { if (fs.existsSync(c) && fs.statSync(c).isFile()) return { path: c, searched: candidates }; } catch { /* ignore */ }
+  }
+  return { path: null, searched: candidates };
 }
 
 function ensureProjectDirs(projectName) {
@@ -196,12 +220,13 @@ const TOOL_LIST = [
     inputSchema: {
       type: "object",
       properties: {
+        ips_file: { type: "string", description: "BEST for large lists (hundreds+ of targets): the name of a file (one IP/CIDR per line) that the user has placed in the _incoming staging folder (projects/_incoming/). Pass just the filename, e.g. \"targets.txt\" — the orchestrator reads the WHOLE file, so nothing is truncated. Use this instead of `ips` when there are more than a few dozen targets, since an inline array gets cut off mid-generation." },
         ips: {
           type: "array",
           items: { type: "string" },
-          description: "Preferred for multi-target scans: an array of IPs/CIDRs (one target per element, e.g. [\"10.0.0.5\", \"206.130.144.0/24\"]). The orchestrator writes these into the scan dir so the workers can read them. Use this instead of pointing `cidr` at a file path you made up.",
+          description: "Good for a handful of targets: an array of IPs/CIDRs (one per element, e.g. [\"10.0.0.5\", \"206.130.144.0/24\"]). For hundreds of targets use `ips_file` instead — a long inline array gets truncated.",
         },
-        cidr: { type: "string", description: "A single CIDR (206.130.144.0/24), a single IP, or the path to an EXISTING file (readable by the orchestrator) with one CIDR/IP per line. For many targets prefer `ips`." },
+        cidr: { type: "string", description: "A single CIDR (206.130.144.0/24), a single IP, or the path to an EXISTING file (readable by the orchestrator) with one CIDR/IP per line. For many targets prefer `ips_file`." },
         project_name: { type: "string", description: "Project folder name (required — used for output file naming and checkpoint)" },
       },
       required: ["project_name"],
@@ -303,11 +328,34 @@ function assembleReport(scanDir, prefix) {
 // `redirected` just changes the returned message so it's clear to the caller
 // (human or LLM) why a "run" request ended up on the 2-phase IP pipeline
 // instead of the 5-phase domain pipeline.
-function runIpScan(cidr, projectNameRaw, redirected, ips) {
+function runIpScan(cidr, projectNameRaw, redirected, ips, ipsFile) {
   const projectName = projectNameRaw.replace(/[^a-zA-Z0-9_-]/g, "-");
   ensureProjectDirs(projectName);
   const scanDir = scanDirFor(projectName);
   fs.mkdirSync(scanDir, { recursive: true });
+
+  // Most robust path for large lists: a file the user staged. The orchestrator
+  // reads the ENTIRE file, so the target count can't be truncated the way an
+  // inline `ips` array is when a model stops emitting mid-array.
+  if (ipsFile) {
+    const resolved = resolveIpsFile(ipsFile, scanDir);
+    if (!resolved.path) {
+      return { content: [{ type: "text", text:
+        `ips_file '${ipsFile}' not found. Place the list (one IP/CIDR per line) in the ` +
+        `staging folder and pass just its filename. Looked in:\n  ` +
+        resolved.searched.join("\n  ") + `\n\nThe simplest location is ${INCOMING_DIR}/${path.basename(ipsFile)}.`,
+      }] };
+    }
+    const contents = fs.readFileSync(resolved.path, "utf8");
+    const cleaned = contents.split(/\r?\n/).map((l) => l.trim()).filter((l) => l && !l.startsWith("#"));
+    if (cleaned.length === 0) {
+      return { content: [{ type: "text", text: `ips_file '${resolved.path}' contained no usable IP/CIDR entries.` }] };
+    }
+    fs.writeFileSync(path.join(scanDir, "ip-targets.txt"), cleaned.join("\n") + "\n");
+    const execTarget = `/workspace/scans/ip-targets.txt`;
+    const displayTarget = `${cleaned.length} target(s) (from ${path.basename(resolved.path)})`;
+    return launchCidrPipeline(scanDir, projectName, execTarget, displayTarget, redirected);
+  }
 
   // Resolve the target the worker containers will actually receive. A bare
   // IP/CIDR is passed through verbatim. A FILE of targets, however, lives on
@@ -428,10 +476,10 @@ async function handleToolCall(name, args) {
     if (!args.project_name) {
       return { content: [{ type: "text", text: "project_name is required." }] };
     }
-    if (!args.cidr && !(Array.isArray(args.ips) && args.ips.length > 0)) {
-      return { content: [{ type: "text", text: "Provide either `ips` (an array of IPs/CIDRs — preferred for lists) or `cidr` (a single IP/CIDR or an existing file path)." }] };
+    if (!args.cidr && !args.ips_file && !(Array.isArray(args.ips) && args.ips.length > 0)) {
+      return { content: [{ type: "text", text: "Provide one of: `ips_file` (a filename in projects/_incoming/ — best for large lists), `ips` (an array for a handful of targets), or `cidr` (a single IP/CIDR or an existing file path)." }] };
     }
-    return runIpScan(args.cidr, args.project_name, false, args.ips);
+    return runIpScan(args.cidr, args.project_name, false, args.ips, args.ips_file);
   }
 
   // ── kuromaku_list_projects ──────────────────────────────────────────────────

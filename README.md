@@ -24,14 +24,23 @@ the only things that make sense against a bare IP. `kuromaku_run` also
 auto-detects an IP/CIDR passed as `domain` and transparently routes here
 instead of running the domain pipeline against it.
 
-**Scanning many IPs — use the `ips` array.** For a list of targets, pass them
-inline via `kuromaku_ip_scan`'s `ips` array (`["10.0.0.5", "206.130.144.0/24", …]`),
-*not* a made-up file path in `cidr`. The orchestrator writes the list into the
-scan directory — the one path that's actually bind-mounted into the worker
-containers — so naabu/nmap can read it. A host path handed to `cidr` that the
-orchestrator can't see is the classic "scanned 1200 IPs, found 0" failure; the
-`ips` array sidesteps it entirely. (`cidr` still accepts a single IP/CIDR, or a
-file path that already exists on the orchestrator's filesystem.)
+**Scanning many IPs.** `kuromaku_ip_scan` takes targets three ways:
+
+- **`ips_file`** — *best for large lists (hundreds+).* Drop a file with one
+  IP/CIDR per line into the `_incoming` staging folder (`projects/_incoming/`)
+  and pass just its name: `{ "project_name": "...", "ips_file": "targets.txt" }`.
+  The orchestrator reads the whole file, so nothing is truncated.
+- **`ips`** — an inline array, fine for a handful of targets:
+  `["10.0.0.5", "206.130.144.0/24"]`. Avoid it for big lists: an LLM caller
+  will truncate a long array mid-generation (observed: a 1200-IP list arrived
+  as 192). The orchestrator writes whatever it receives into the scan dir.
+- **`cidr`** — a single IP/CIDR, or a file path that already exists on the
+  orchestrator's filesystem.
+
+All three end up written into the scan directory — the one path bind-mounted
+into the worker containers — so naabu/nmap can read it. A host path handed to
+`cidr` that the orchestrator can't see is the classic "scanned 1200 IPs,
+found 0" failure; `ips_file`/`ips` sidestep it.
 
 ## Directory layout
 

@@ -40,14 +40,18 @@ structural changes.
 - IP/CIDR targets skip all hostname-dependent tools entirely (no amass/
   subfinder/gau/nuclei/dirsearch) — this is intentional, not a gap to "fix"
   by trying to run them anyway.
-- Multi-target IP scans come in via `kuromaku_ip_scan`'s `ips` **array**, not a
-  file path. The workers only see `<scanDir>:/workspace/scans`, so a host file
-  path handed to `--cidr` is invisible inside the container — that was the
-  "scanned a 1200-IP list, found 0 IPs" bug. The orchestrator now writes `ips`
-  (or a real, orchestrator-visible file passed as `cidr`) into the scan dir as
-  `ip-targets.txt` and hands the worker the container path. Keep the three
-  pieces in sync if you touch this: `runIpScan`/`launchCidrPipeline` in
-  `index.js` (writes the list, passes the container path), `cidrPrefix` in
+- Multi-target IP scans come in via `kuromaku_ip_scan`. Three input shapes,
+  all normalized by `runIpScan` into `<scanDir>/ip-targets.txt` with the worker
+  given the container path `/workspace/scans/ip-targets.txt`:
+  `ips_file` (a filename staged in `PROJECTS_DIR/_incoming/` — **use this for
+  hundreds of targets**; an inline `ips` array gets truncated by the LLM
+  mid-generation, e.g. 1200 IPs arrived as 192), `ips` (array, for a handful),
+  and `cidr` (a single IP/CIDR or an orchestrator-visible file path). The
+  workers only see `<scanDir>:/workspace/scans`, so a host path handed to
+  `--cidr` that the orchestrator can't resolve is invisible in the container —
+  that was the original "scanned a 1200-IP list, found 0 IPs" bug. Keep these
+  in sync if you touch this: `runIpScan`/`launchCidrPipeline` in `index.js`
+  (writes the list, passes the container path), `cidrPrefix` in
   `orchestrator.js` (basename-vs-string rule must match the worker), and
   `phase-network.sh`'s CIDR branch (copies the file's *contents* into
   `unique-ips.log`, never the path string).
