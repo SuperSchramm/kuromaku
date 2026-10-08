@@ -77,9 +77,16 @@ if [ -n "${cidr_input:-}" ]; then
   log "CIDR mode — skipping DNS resolution (no hostnames)"
 
   # unique-ips.log: nmap -iL and naabu -list both accept CIDR notation
-  # directly, so for a CIDR input we write the CIDR itself rather than
-  # expanding to individual IPs (prips not available in Alpine).
-  echo "$cidr_input" > "$TARGET_PREFIX-unique-ips.log"
+  # directly, so for a single CIDR/IP input we write the CIDR itself rather
+  # than expanding to individual IPs (prips not available in Alpine). For a
+  # FILE of targets we copy its contents (one IP/CIDR per line) — writing the
+  # path string here instead was the "0 IPs" bug: nmap -iL then read a single
+  # path line as a target and scanned nothing.
+  if [ -f "$cidr_input" ]; then
+    grep -vE '^\s*(#|$)' "$cidr_input" > "$TARGET_PREFIX-unique-ips.log" || true
+  else
+    echo "$cidr_input" > "$TARGET_PREFIX-unique-ips.log"
+  fi
   IP_COUNT=$(wc -l < "$TARGET_PREFIX-unique-ips.log")
   log "$IP_COUNT range(s)/IP(s) recorded — Output: $TARGET_PREFIX-unique-ips.log"
 

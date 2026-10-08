@@ -221,8 +221,46 @@ function runIpScan(cidr, projectNameRaw, redirected) {
   const scanDir = scanDirFor(projectName);
   fs.mkdirSync(scanDir, { recursive: true });
 
+  // Resolve the target the worker containers will actually receive. A bare
+  // IP/CIDR is passed through verbatim. A FILE of targets, however, lives on
+  // the orchestrator's filesystem and is NOT visible inside the worker
+  // containers (only <scanDir>:/workspace/scans is mounted). So copy it into
+  // the scan dir under a fixed name and hand the workers the container-internal
+  // path — otherwise `[ -f "$cidr_input" ]` is false in the worker, the path
+  // string gets treated as a single host, and naabu/nmap scan nothing (the
+  // "found 0 IPs for a 1200-IP list" bug).
+  const cidrStr = String(cidr).trim();
+  let execTarget = cidrStr;        // what the worker containers receive via --cidr
+  let displayTarget = cidrStr;     // what we show the user / store as checkpoint `domain`
+  if (!isIpOrCidr(cidrStr)) {
+    if (!fs.existsSync(cidrStr)) {
+      return { content: [{ type: "text", text:
+        `'${cidrStr}' is neither a valid IP/CIDR nor an existing file path.\n\n` +
+        `For an IP list, pass a file with one IP/CIDR per line, and make sure the ` +
+        `path is readable by the orchestrator container — the simplest place is ` +
+        `under the mounted projects directory (e.g. ${path.join(PROJECTS_DIR, projectName)}/ip-targets.txt).`,
+      }] };
+    }
+    try {
+      const stat = fs.statSync(cidrStr);
+      if (!stat.isFile()) throw new Error("not a regular file");
+      const contents = fs.readFileSync(cidrStr, "utf8");
+      if (contents.trim() === "") {
+        return { content: [{ type: "text", text: `Target file '${cidrStr}' is empty — nothing to scan.` }] };
+      }
+      const destName = "ip-targets.txt";
+      fs.writeFileSync(path.join(scanDir, destName), contents);
+      execTarget = `/workspace/scans/${destName}`;
+      displayTarget = `${path.basename(cidrStr)} (${contents.split("\n").filter((l) => l.trim()).length} targets)`;
+    } catch (e) {
+      return { content: [{ type: "text", text: `Could not read target file '${cidrStr}': ${e.message}` }] };
+    }
+  }
+
   if (!cp.checkpointExists(scanDir)) {
-    orch.createCidrCheckpoint(scanDir, { project: projectName, cidr, options: {} });
+    // Store execTarget in options.cidr (the pipeline + resume read it); keep
+    // displayTarget as the human-facing `domain` field.
+    orch.createCidrCheckpoint(scanDir, { project: projectName, cidr: displayTarget, options: { cidr: execTarget } });
   } else {
     const existing = cp.readCheckpoint(scanDir);
     if (existing.mode !== "cidr") {
@@ -232,7 +270,7 @@ function runIpScan(cidr, projectNameRaw, redirected) {
 
   const key = `cidr:${projectName}`;
   if (!activePipelines.has(key)) {
-    const promise = orch.runCidrPipeline(scanDir, cidr)
+    const promise = orch.runCidrPipeline(scanDir, execTarget)
       .catch((e) => console.error(`[orchestrator] CIDR pipeline error for ${projectName}:`, e))
       .finally(() => activePipelines.delete(key));
     activePipelines.set(key, promise);
@@ -241,14 +279,14 @@ function runIpScan(cidr, projectNameRaw, redirected) {
   const lines = [];
   if (redirected) {
     lines.push(
-      `'${cidr}' is an IP address/CIDR, not a hostname — domain-only tools ` +
+      `'${displayTarget}' is an IP address/CIDR, not a hostname — domain-only tools ` +
       `(subfinder, amass, gau, nuclei, dirsearch) don't make sense against a ` +
       `bare IP, so this was routed to the IP-scan pipeline automatically.`,
       ``,
     );
   }
   lines.push(
-    `IP scan started for '${cidr}' (project: ${projectName}).`,
+    `IP scan started for '${displayTarget}' (project: ${projectName}).`,
     `Pipeline: network (naabu port scan) -> webscan (nmap service detection).`,
     `No hostname-based steps run for IP-space targets.`,
     ``,

@@ -1,14 +1,14 @@
 # ─── Stage 1: Build Go-based tools ─────────────────────────────────────────────
-FROM golang:1.25-alpine AS builder
+FROM golang:1.26-alpine AS builder
 
 RUN apk add --no-cache git
 
 ENV CGO_ENABLED=0
 
 # ProjectDiscovery toolchain
-RUN go install github.com/projectdiscovery/httpx/cmd/httpx@latest
-RUN go install github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
-RUN go install github.com/projectdiscovery/katana/cmd/katana@latest
+RUN go install -v github.com/projectdiscovery/httpx/cmd/httpx@latest
+RUN go install -v github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
+RUN go install -v github.com/projectdiscovery/katana/cmd/katana@latest
 
 # OSINT / URL collection
 RUN go install github.com/lc/gau/v2/cmd/gau@latest

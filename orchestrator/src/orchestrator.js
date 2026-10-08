@@ -188,12 +188,25 @@ function buildCidrDockerArgs(phase, scanDir, cidrInput) {
   return args;
 }
 
+// Matches a bare IPv4 address or IPv4 CIDR (mirrors index.js's IPV4_OR_CIDR_RE).
+// Used to tell a real IP/CIDR target apart from a file path.
+const IPV4_OR_CIDR_RE = /^(\d{1,3}\.){3}\d{1,3}(\/\d{1,2})?$/;
+
 // CIDR mode reuses the same prefix derivation as the phase scripts:
 // tr '/.' '_-' applied to the CIDR string (or file basename).
+//
+// The worker decides file-vs-string with `[ -f "$cidr_input" ]` inside the
+// container. We can't replicate that here (a file target is passed as a
+// container-internal path like /workspace/scans/ip-targets.txt that doesn't
+// exist from the orchestrator's view), so we treat anything that isn't a bare
+// IP/CIDR but looks like a path as a file and use its basename — matching the
+// worker's basename branch. fsExists stays as a fallback for host-visible paths.
 function cidrPrefix(cidrInput) {
-  const isFile = fsExists(cidrInput);
-  const raw = isFile ? path.basename(cidrInput) : cidrInput;
-  return raw.replace(/[/.]/g, (c) => (c === "/" ? "_" : "-"));
+  const raw = String(cidrInput).trim();
+  const looksLikePath = raw.includes("/") && !IPV4_OR_CIDR_RE.test(raw);
+  const useBasename = looksLikePath || fsExists(raw);
+  const base = useBasename ? path.basename(raw) : raw;
+  return base.replace(/[/.]/g, (c) => (c === "/" ? "_" : "-"));
 }
 
 function fsExists(p) {
