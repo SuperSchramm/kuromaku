@@ -145,7 +145,7 @@ const TOOL_LIST = [
       type: "object",
       properties: {
         project_name: { type: "string" },
-        file: { type: "string", description: "One of: uniqdomains, naabu, nucleiAlerts, dirsearch, nmapvulners, dalfox, resolved, report" },
+        file: { type: "string", description: "One of: uniqdomains, uniqueips, naabu, nucleiAlerts, dirsearch, nmapvulners, dalfox, resolved, report" },
         max_lines: { type: "number", default: 100 },
       },
       required: ["project_name"],
@@ -213,6 +213,15 @@ function isIpOrCidr(str) {
 }
 
 function findPrefix(scanDir, cpData) {
+  // CIDR mode: output files are named with the cidrPrefix() derivation applied
+  // to options.cidr (the worker-visible target), NOT the human-readable
+  // `domain` field — which may be a label like "3 target(s) (inline ips list)".
+  // Must use the same derivation the pipeline/workers use or every file lookup
+  // misses and kuromaku_results reports "no results" for a scan that produced
+  // plenty (see git history: this exact mismatch).
+  if (cpData.mode === "cidr") {
+    return orch.cidrPrefix(cpData.options.cidr);
+  }
   // domain_list mode stores basename; domain mode stores the domain itself.
   return cpData.options.domain_list
     ? path.basename(cpData.options.domain_list)
@@ -539,6 +548,7 @@ async function handleToolCall(name, args) {
 
     const fileMap = {
       uniqdomains: `${prefix}-uniqdomains.log`,
+      uniqueips: `${prefix}-unique-ips.log`,
       naabu: `${prefix}-naabu.log`,
       nucleiAlerts: `${prefix}-nucleiAlerts.log`,
       dirsearch: `${prefix}-dirsearch.log`,

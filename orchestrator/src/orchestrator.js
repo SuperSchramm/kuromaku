@@ -225,7 +225,7 @@ const IPV4_OR_CIDR_RE = /^(\d{1,3}\.){3}\d{1,3}(\/\d{1,2})?$/;
 // exist from the orchestrator's view), so we treat anything that isn't a bare
 // IP/CIDR but looks like a path as a file and use its basename — matching the
 // worker's basename branch. fsExists stays as a fallback for host-visible paths.
-function cidrPrefix(cidrInput) {
+export function cidrPrefix(cidrInput) {
   const raw = String(cidrInput).trim();
   const looksLikePath = raw.includes("/") && !IPV4_OR_CIDR_RE.test(raw);
   const useBasename = looksLikePath || fsExists(raw);
