@@ -52,11 +52,35 @@ function hostScanDir(scanDir) {
       "to the projects directory (Docker-from-Docker requires host paths for -v mounts)."
     );
   }
-  // scanDir is this container's internal path, e.g. /workspace/projects/<name>/scans
-  // Re-root it onto the host path.
+  // scanDir is ALWAYS this Linux container's POSIX path, e.g.
+  // /workspace/projects/<name>/scans — so compute the relative segment with the
+  // POSIX resolver regardless of what the host OS is.
   const internalProjectsDir = process.env.PROJECTS_DIR || "/workspace/projects";
-  const relative = path.relative(internalProjectsDir, scanDir);
-  return path.join(hostProjectsDir, relative);
+  const relative = path.posix.relative(internalProjectsDir, scanDir);
+
+  // Re-root onto the host path, PRESERVING the host path's separator style. The
+  // spawned `docker run -v <host>:/workspace/scans` is executed by the HOST
+  // daemon (via the mounted socket), so the mount path must be valid for the
+  // host OS — not for this Linux container. HOST_PROJECTS_DIR can therefore be
+  // any of:
+  //   Windows drive-letter : C:\Users\me\projects  or  C:/Users/me/projects
+  //   WSL                  : /mnt/c/Users/me/projects
+  //   macOS / Linux        : /Users/me/projects  or  /home/me/projects
+  // The old code used path.join() (POSIX inside this container), which mangled a
+  // Windows path into mixed C:\...\projects/<name>/scans separators. Docker
+  // doesn't error on that — it silently creates an empty anonymous volume, so
+  // the worker runs, exits 0, and writes nothing. That's the "scan runs clean
+  // but finds nothing" failure.
+  const isWindowsHostPath = /^[A-Za-z]:[\\/]/.test(hostProjectsDir) || hostProjectsDir.includes("\\");
+  if (isWindowsHostPath) {
+    // Normalize the whole thing to backslashes so the only ':' remaining are the
+    // drive colon and the -v mount colon (mixed '/' is what broke the mount).
+    const base = hostProjectsDir.replace(/\//g, "\\").replace(/\\+$/, "");
+    const rel = relative.split("/").join("\\");
+    return rel ? `${base}\\${rel}` : base;
+  }
+  // POSIX host path (Linux, macOS, or WSL's /mnt/c form) — join with '/'.
+  return path.posix.join(hostProjectsDir, relative);
 }
 
 function buildDockerArgs(phase, scanDir, opts) {
