@@ -193,7 +193,7 @@ const TOOL_LIST = [
       type: "object",
       properties: {
         project_name: { type: "string" },
-        file: { type: "string", description: "One of: uniqdomains, uniqueips, naabu, nucleiAlerts, dirsearch, nmapvulners, dalfox, resolved, report" },
+        file: { type: "string", description: "One of: uniqdomains, uniqueips, naabu, nucleiAlerts, dirsearch, nmapvulners, dalfox, resolved, report, outOfScope" },
         max_lines: { type: "number", default: 100 },
       },
       required: ["project_name"],
@@ -301,6 +301,7 @@ function outputFileMap(prefix) {
   return {
     resolved: `${prefix}-resolved.log`,
     uniqdomains: `${prefix}-uniqdomains.log`,
+    outOfScope: `${prefix}-out-of-scope.log`,
     uniqueips: `${prefix}-unique-ips.log`,
     naabu: `${prefix}-naabu.log`,
     nmapvulners: `${prefix}-nmapvulners.log`,
@@ -315,6 +316,7 @@ function outputFileMap(prefix) {
 const FILE_LABELS = {
   resolved: "DNS Resolution",
   uniqdomains: "Unique Subdomains",
+  outOfScope: "Out-of-Scope Hosts Dropped (recon found these but scope excluded them)",
   uniqueips: "Unique IPs",
   naabu: "Open Ports (naabu)",
   nmapvulners: "Service & Vulnerability Detection (nmap + vulners)",
@@ -812,6 +814,24 @@ function startPipeline(projectName, scanDir) {
   }
 
   const nextPhase = cp.nextPendingPhase(checkpoint);
+
+  // No scope -> recon's gau/katana crawl will pull in third-party/library
+  // domains unrelated to the target (e.g. CDN/analytics/API hosts linked
+  // from the target's own pages), and nothing will filter them out before
+  // network/webscan/xss scan them too. This line is addressed to the
+  // CALLING LLM, not the end user directly — it's instructing the model
+  // reading this tool result to relay the question, since an MCP tool
+  // can't prompt the user itself.
+  const scopeWarning = (Array.isArray(scope) && scope.length > 0) ? "" :
+    `\n⚠ No 'scope' was provided for this scan. Recon's domain discovery ` +
+    `(gau/katana crawling the target's pages) commonly pulls in third-party ` +
+    `domains that have nothing to do with the target — those get scanned by ` +
+    `network/webscan/xss too unless scope restricts results to the target. ` +
+    `Ask the user now whether they want to set a scope (in-scope domain ` +
+    `glob patterns) for this scan. If they do, stop this run with ` +
+    `kuromaku_stop and re-call kuromaku_run with 'scope' set before it ` +
+    `progresses past recon.\n`;
+
   return {
     content: [{
       type: "text",
@@ -821,7 +841,7 @@ function startPipeline(projectName, scanDir) {
         `Next phase: ${nextPhase || "(all done)"}`,
         ``,
         cp.summarize(checkpoint),
-        ``,
+        scopeWarning,
         `Monitor with: kuromaku_status { "project_name": "${projectName}" }`,
         ``,
         `⚠ Only scan targets you have explicit written authorization to test.`,

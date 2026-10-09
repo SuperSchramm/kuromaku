@@ -100,8 +100,13 @@ in_scope() {
 filter_by_scope() {
   ## Filter a file in place, keeping only lines whose extracted host matches
   ## a pattern in $SCOPE_FILE. No-op if SCOPE_FILE is unset or the file
-  ## doesn't exist.
+  ## doesn't exist. If $2 (dropfile) is given, every dropped host is appended
+  ## there instead of being discarded — bounty/red-team scope lists are
+  ## routinely incomplete, so the out-of-scope hosts recon actually found are
+  ## worth keeping for review (did we just miss them in scope, or are they
+  ## genuinely third-party?) without stopping or re-running the scan for it.
   local infile="$1"
+  local dropfile="${2:-}"
   [ -z "${SCOPE_FILE:-}" ] && return 0
   [ -f "$infile" ] || return 0
   local tmp="${infile}.scoped"
@@ -114,6 +119,8 @@ filter_by_scope() {
     if in_scope "$host"; then
       echo "$line" >> "$tmp"
       kept=$((kept + 1))
+    elif [ -n "$dropfile" ]; then
+      echo "$host" >> "$dropfile"
     fi
   done < "$infile"
   mv "$tmp" "$infile"
@@ -187,9 +194,18 @@ if [ -z "${domain_list:-}" ]; then
 
   ## Restrict to in-scope hosts BEFORE dedup/normalization, so out-of-scope
   ## domains (e.g. third-party links katana crawled) never enter
-  ## uniqdomains.log/domains_only.log or any downstream phase.
-  filter_by_scope "$tdir/$baseDomain-predomains.log"
+  ## uniqdomains.log/domains_only.log or any downstream phase. Dropped hosts
+  ## are captured once, from the merged predomains list, into
+  ## out-of-scope.log for later review — not from gau-dirty.log too, which
+  ## would just duplicate the same hosts from raw URLs.
+  OUT_OF_SCOPE_FILE="$tdir/$baseDomain-out-of-scope.log"
+  [ -n "${SCOPE_FILE:-}" ] && : > "$OUT_OF_SCOPE_FILE"
+  filter_by_scope "$tdir/$baseDomain-predomains.log" "$OUT_OF_SCOPE_FILE"
   filter_by_scope "$tdir/$baseDomain-gau-dirty.log"
+  if [ -n "${SCOPE_FILE:-}" ] && [ -s "$OUT_OF_SCOPE_FILE" ]; then
+    sort -u -o "$OUT_OF_SCOPE_FILE" "$OUT_OF_SCOPE_FILE"
+    log "$(wc -l < "$OUT_OF_SCOPE_FILE") out-of-scope host(s) dropped — see $(basename "$OUT_OF_SCOPE_FILE")"
+  fi
 
   ## Normalize: strip scheme, www, ports, paths, whitespace
   sed -E 's|^\s*https?://||g' "$tdir/$baseDomain-predomains.log" \
@@ -216,8 +232,14 @@ else
   if [ -n "${SCOPE_FILE:-}" ]; then
     filtered_list="$tdir/${daBase}.scoped"
     cp "$domain_list" "$filtered_list"
-    filter_by_scope "$filtered_list"
+    OUT_OF_SCOPE_FILE="$tdir/$daBase-out-of-scope.log"
+    : > "$OUT_OF_SCOPE_FILE"
+    filter_by_scope "$filtered_list" "$OUT_OF_SCOPE_FILE"
     domain_list="$filtered_list"
+    if [ -s "$OUT_OF_SCOPE_FILE" ]; then
+      sort -u -o "$OUT_OF_SCOPE_FILE" "$OUT_OF_SCOPE_FILE"
+      log "$(wc -l < "$OUT_OF_SCOPE_FILE") out-of-scope host(s) dropped — see $(basename "$OUT_OF_SCOPE_FILE")"
+    fi
   fi
 
   httpx -l "$domain_list" -silent -fc "$returnCodes2Ignore" \

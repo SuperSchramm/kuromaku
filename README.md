@@ -92,7 +92,7 @@ Parameters marked **required** must be supplied; everything else is optional.
 | `skip_nuclei` | boolean | `false` | Skip nuclei in the webscan phase. |
 | `llm_url` | string | — | LM Studio OpenAI-compatible URL for the report's executive summary. |
 | `llm_model` | string | — | Model name for the executive summary. Without `llm_url`/`llm_model` a templated summary is used. |
-| `scope` | string[] | — | In-scope glob patterns (`example.com` = exact host, `*.example.com` = subdomains only, not the apex). The target itself is not auto-included. Out-of-scope discoveries are dropped before network/webscan/xss. |
+| `scope` | string[] | — | In-scope glob patterns (`example.com` = exact host, `*.example.com` = subdomains only, not the apex). The target itself is not auto-included. Out-of-scope discoveries are dropped before network/webscan/xss (saved to `out-of-scope.log`, see below) — never scanned, never silently added back. If omitted entirely, the response warns that recon's crawl (gau/katana) commonly pulls in unrelated third-party domains that will then be scanned downstream too. |
 
 If a checkpoint already exists with all phases done this is a no-op; use `kuromaku_resume` with `force: true` to re-run.
 
@@ -167,7 +167,19 @@ memory caps and nuclei concurrency/rate-limit values.
 `kuromaku_run` accepts a `scope` array of glob patterns (e.g. from a
 Bugcrowd/HackerOne program's in-scope list). When provided, every discovered
 domain outside that list is dropped before network/webscan/xss ever run
-against it.
+against it — dropped hosts are never scanned.
+
+Recon almost always turns up hosts outside the list you gave it (third-party
+CDN/API/analytics domains linked from the target's own pages, in particular).
+That's expected and doesn't interrupt the scan: dropped hosts are written to
+`<prefix>-out-of-scope.log` (readable via `kuromaku_results` /
+`kuromaku_report`) so you can review later whether any of them should've been
+in scope, without stopping or re-running anything.
+
+If `scope` is omitted entirely, `kuromaku_run`/`kuromaku_resume` return a
+warning asking you to confirm that's intentional — that's the one case worth
+catching before the scan runs, since without any scope list nothing gets
+filtered and recon's noise goes straight into network/webscan/xss.
 
 ## Authorization
 
