@@ -25,7 +25,7 @@ const PROFILES = {
     recon:   { image: "kuromaku-recon",   memory: "4g", caps: [] },
     network: { image: "kuromaku-network", memory: "2g", caps: ["NET_RAW", "NET_ADMIN"] },
     webscan: { image: "kuromaku-webscan", memory: "8g", caps: ["NET_RAW"],
-               env: { NUCLEI_BULK_SIZE: "20", NUCLEI_CONCURRENCY: "20", NUCLEI_RATE_LIMIT: "80" } },
+               env: { NUCLEI_BULK_SIZE: "25", NUCLEI_CONCURRENCY: "25", NUCLEI_RATE_LIMIT: "150" } },
     xss:     { image: "kuromaku-xss",     memory: "4g", caps: [] },
     report:  { image: "kuromaku-report",  memory: "1g", caps: [] },
   },

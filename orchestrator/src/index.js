@@ -28,6 +28,30 @@ const PROJECTS_DIR = process.env.PROJECTS_DIR || "/workspace/projects";
 const INCOMING_DIR = path.join(PROJECTS_DIR, "_incoming");
 try { fs.mkdirSync(INCOMING_DIR, { recursive: true }); } catch { /* best effort */ }
 
+// Live detail for kuromaku_status: tail of the progress log, how long since it
+// last changed, and any partial nuclei output — so a long phase is observable
+// without docker logs. Pure file reads; never throws.
+function liveDetail(scanDir) {
+  const out = [];
+  try {
+    const logPath = path.join(scanDir, "kuromaku_progress.log");
+    if (fs.existsSync(logPath)) {
+      const st = fs.statSync(logPath);
+      const ageS = Math.round((Date.now() - st.mtimeMs) / 1000);
+      const tail = fs.readFileSync(logPath, "utf-8").split("\n").filter(Boolean).slice(-15);
+      out.push("", `Progress log (last ${tail.length} lines; last write ${ageS}s ago):`, ...tail.map(l => "  " + l));
+      if (ageS > 300) out.push(`  ⚠ no log output for ${Math.round(ageS / 60)}m — phase may be stalled`);
+    }
+    for (const f of fs.readdirSync(scanDir)) {
+      if (f.endsWith("-nuclei-batch.log")) {
+        const n = fs.readFileSync(path.join(scanDir, f), "utf-8").split("\n").filter(Boolean).length;
+        out.push("", `Nuclei in-flight batch findings so far: ${n} (${f})`);
+      }
+    }
+  } catch { /* best-effort */ }
+  return out.join("\n");
+}
+
 function scanDirFor(projectName) {
   return path.join(PROJECTS_DIR, projectName, "scans");
 }
@@ -650,7 +674,7 @@ async function handleToolCall(name, args) {
     return {
       content: [{
         type: "text",
-        text: cp.summarize(checkpoint) + (isRunning ? "\n\n(orchestrator pipeline actively running in this session)" : ""),
+        text: cp.summarize(checkpoint) + (isRunning ? "\n\n(orchestrator pipeline actively running in this session)" : "") + liveDetail(scanDir),
       }],
     };
   }

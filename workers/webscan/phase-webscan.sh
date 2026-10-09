@@ -124,6 +124,10 @@ fi
 NUCLEI_BULK_SIZE=${NUCLEI_BULK_SIZE:-5}
 NUCLEI_CONCURRENCY=${NUCLEI_CONCURRENCY:-5}
 NUCLEI_RATE_LIMIT=${NUCLEI_RATE_LIMIT:-25}
+## Hard cap per tag batch (seconds). A batch that hits it is logged and skipped
+## so one slow batch can't hold the whole phase for hours; partial findings
+## already written to the batch file are kept.
+NUCLEI_BATCH_TIMEOUT=${NUCLEI_BATCH_TIMEOUT:-2700}
 
 if [ -n "${cidr_input:-}" ]; then
   log "CIDR mode — skipping nuclei (no hostnames)"
@@ -153,15 +157,16 @@ elif [ "$SKIP_NUCLEI" -eq 0 ]; then
     # nuclei's own -stats output stalls on a slow host. Killed once nuclei exits.
     ( while true; do
         sleep 60
-        echo " █▄▄▪ [webscan] heartbeat — nuclei batch '$batch_tags' still running, $(date +%H:%M:%S)" >> "$PROGRESS_LOG"
+        echo " █▄▄▪ [webscan] heartbeat — nuclei batch '$batch_tags' still running, $(date +%H:%M:%S), $(wc -l < "$TARGET_PREFIX-nuclei-batch.log" 2>/dev/null || echo 0) findings so far" | tee -a "$PROGRESS_LOG"
       done ) &
     HEARTBEAT_PID=$!
 
     ## -stats + -stats-interval prints periodic progress (% complete, req/sec,
     ## hosts scanned) to stderr. Redirecting 2>&1 into the progress log gives a
     ## real-time view of nuclei's actual progress, not just a heartbeat.
-    nuclei -l "$UNIQ_DOMAINS_FILE" \
+    timeout "$NUCLEI_BATCH_TIMEOUT" nuclei -l "$UNIQ_DOMAINS_FILE" \
       -tags "$batch_tags" \
+      -etags "dos,fuzz,intrusive" \
       -severity "critical,high,medium" \
       -rate-limit "$NUCLEI_RATE_LIMIT" \
       -bulk-size "$NUCLEI_BULK_SIZE" \
@@ -173,10 +178,14 @@ elif [ "$SKIP_NUCLEI" -eq 0 ]; then
       -stats-interval 15 \
       -silent \
       -o "$TARGET_PREFIX-nuclei-batch.log" 2>&1 | \
-      sed "s/^/ █▄▄▪ [webscan] [nuclei:$batch_tags] /" >> "$PROGRESS_LOG"
+      sed -u "s/^/ █▄▄▪ [webscan] [nuclei:$batch_tags] /" | tee -a "$PROGRESS_LOG"
 
+    NUCLEI_RC=${PIPESTATUS[0]}
     kill "$HEARTBEAT_PID" 2>/dev/null
     wait "$HEARTBEAT_PID" 2>/dev/null
+    if [ "$NUCLEI_RC" -eq 143 ] || [ "$NUCLEI_RC" -eq 124 ]; then
+      log "Batch '$batch_tags' hit the ${NUCLEI_BATCH_TIMEOUT}s timeout — keeping partial findings, moving on"
+    fi
 
     if [ -f "$TARGET_PREFIX-nuclei-batch.log" ]; then
       cat "$TARGET_PREFIX-nuclei-batch.log" >> "$TARGET_PREFIX-nuclei.log"
@@ -229,7 +238,7 @@ if [ "$HOST_COUNT" -gt 0 ]; then
   # Heartbeat so the progress log never goes silent even if nmap's own stats stall.
   ( while true; do
       sleep 60
-      echo " █▄▄▪ [webscan] heartbeat — nmap still running ($HOST_COUNT hosts), $(date +%H:%M:%S)" >> "$PROGRESS_LOG"
+      echo " █▄▄▪ [webscan] heartbeat — nmap still running ($HOST_COUNT hosts), $(date +%H:%M:%S)" | tee -a "$PROGRESS_LOG"
     done ) &
   NMAP_HEARTBEAT_PID=$!
 
