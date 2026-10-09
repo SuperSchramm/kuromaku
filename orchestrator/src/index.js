@@ -106,6 +106,17 @@ const TOOL_LIST = [
         skip_nuclei: { type: "boolean", default: false },
         llm_url: { type: "string", description: "LM Studio OpenAI-compatible URL for report exec summary" },
         llm_model: { type: "string", description: "Model name for report exec summary" },
+        target_url: {
+          type: "string",
+          description:
+            "Explicit host[:port] to guarantee gets scanned, e.g. 'internal-host:3000'. " +
+            "Use this for private/internal targets (nothing for subfinder/amass/gau to " +
+            "publicly index) or targets on a non-standard port (katana's own crawl always " +
+            "hits https://<domain>, so a plain-HTTP or non-443 target can otherwise never " +
+            "surface). Additive, not a replacement — normal discovery (subfinder/amass/" +
+            "gau/katana) still runs; this just ensures the explicit target survives into " +
+            "uniqdomains.log even if discovery finds nothing for it at all.",
+        },
         scope: {
           type: "array",
           items: { type: "string" },
@@ -235,8 +246,13 @@ const TOOL_LIST = [
       "fingerprints — for DMZ/network exposure audits (e.g. 'is anything " +
       "exposed on 206.130.144.0/24 beyond what's approved?'). Runs a 2-phase " +
       "pipeline: network (naabu port scan) -> webscan (nmap service/version " +
-      "detection, vulners script). No hostname-based steps (recon/dirsearch/" +
-      "nuclei/xss) — this is IP-space only. Creates its own lightweight " +
+      "detection, vulners script, PLUS nuclei + dirsearch against any open " +
+      "common web port — 80/443/8080/8443/9000/9090/10000/10010/10020 — " +
+      "using bare ip:port targets, no hostname needed). Still no recon/xss " +
+      "(subfinder/amass/gau genuinely require a hostname to enumerate " +
+      "against) — this is IP-space only. A web service on a port outside " +
+      "that list won't be auto-detected; use kuromaku_run with target_url " +
+      "for a known host:port instead. Creates its own lightweight " +
       "checkpoint; use kuromaku_status with the same project_name to monitor. " +
       "To scan MANY targets, pass them inline via `ips` — do NOT invent a file " +
       "path for `cidr`, since a host path isn't visible inside the worker " +
@@ -476,8 +492,9 @@ function launchCidrPipeline(scanDir, projectName, execTarget, displayTarget, red
   }
   lines.push(
     `IP scan started for '${displayTarget}' (project: ${projectName}).`,
-    `Pipeline: network (naabu port scan) -> webscan (nmap service detection).`,
-    `No hostname-based steps run for IP-space targets.`,
+    `Pipeline: network (naabu port scan) -> webscan (nmap service detection; ` +
+    `nuclei + dirsearch too, against any open common web port).`,
+    `No hostname-dependent discovery (subfinder/amass/gau/recon/xss) runs for IP-space targets.`,
     ``,
     `Monitor with: kuromaku_status { "project_name": "${projectName}" }`,
     ``,
@@ -568,6 +585,7 @@ async function handleToolCall(name, args) {
           llm_url: args.llm_url,
           llm_model: args.llm_model,
           scope: args.scope,
+          target_url: args.target_url,
         },
       });
     }
@@ -804,6 +822,7 @@ function startPipeline(projectName, scanDir) {
     llm_url: checkpoint.options.llm_url,
     llm_model: checkpoint.options.llm_model,
     scope_file: scopeFile,
+    target_url: checkpoint.options.target_url,
   };
 
   if (!activePipelines.has(projectName)) {

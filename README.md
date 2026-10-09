@@ -93,6 +93,7 @@ Parameters marked **required** must be supplied; everything else is optional.
 | `llm_url` | string | — | LM Studio OpenAI-compatible URL for the report's executive summary. |
 | `llm_model` | string | — | Model name for the executive summary. Without `llm_url`/`llm_model` a templated summary is used. |
 | `scope` | string[] | — | In-scope glob patterns (`example.com` = exact host, `*.example.com` = subdomains only, not the apex). The target itself is not auto-included. Out-of-scope discoveries are dropped before network/webscan/xss (saved to `out-of-scope.log`, see below) — never scanned, never silently added back. If omitted entirely, the response warns that recon's crawl (gau/katana) commonly pulls in unrelated third-party domains that will then be scanned downstream too. |
+| `target_url` | string | — | Explicit `host[:port]` guaranteed to survive into `uniqdomains.log` even if subfinder/amass/gau/katana find nothing for it. For a private/internal target (nothing publicly indexed) or one on a non-standard port (katana's own crawl always hits `https://<domain>`, so a plain-HTTP or non-443 target otherwise never gets probed). Additive — normal discovery still runs. |
 
 If a checkpoint already exists with all phases done this is a no-op; use `kuromaku_resume` with `force: true` to re-run.
 
@@ -105,6 +106,15 @@ If a checkpoint already exists with all phases done this is a no-op; use `kuroma
 | `cidr` | string | A single IP/CIDR, or an orchestrator-visible file path. |
 
 Supply at least one of `ips_file`, `ips`, or `cidr`.
+
+The webscan phase now also runs nuclei and dirsearch in CIDR mode, against
+bare `ip:port` targets, for any open port in the common-web-port set (80,
+443, 8080, 8443, 9000, 9090, 10000, 10010, 10020 — naabu already confirmed
+these are open, so no extra probe is needed). Only subfinder/amass/gau/recon/
+xss stay hostname-only and skipped — those genuinely have nothing to
+enumerate against a bare IP. A web service on a port outside that list isn't
+auto-detected; use `kuromaku_run` with `target_url` for a known `host:port`
+instead.
 
 #### `kuromaku_status`
 | Parameter | Type | Description |

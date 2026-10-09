@@ -3,9 +3,15 @@
 ## Runs inside the kuromaku-recon container. Writes results to /workspace/scans
 ## (mounted from projects/<name>/scans on the host).
 ##
-## Usage: phase-recon.sh -d <domain> -t <scan_dir> [--threads N]
+## Usage: phase-recon.sh -d <domain> -t <scan_dir> [--threads N] [--seed host[:port]]
 ##        phase-recon.sh -dl <domain_list_file> -t <scan_dir> [--threads N]
 ##
+## --seed guarantees an explicit host[:port] survives into uniqdomains.log
+## even if subfinder/amass/gau/katana find nothing for it — needed for
+## private/internal targets (nothing to publicly index) and targets on a
+## non-443 port (katana's own crawl always hits https://$baseDomain, so a
+## plain-HTTP or non-standard-port target otherwise never gets probed at
+## all). Additive only — discovery still runs as normal; -d/-dl mode only.
 ## Required outputs (validated by orchestrator):
 ##   <prefix>-uniqdomains.log
 ##   <prefix>-domains_only.log
@@ -27,6 +33,8 @@ while (( "$#" )); do
       THREADS=$2; shift 2 ;;
     --scope-file)
       SCOPE_FILE=$2; shift 2 ;;
+    --seed)
+      SEED_TARGET=$2; shift 2 ;;
     *)
       PARAMS="$PARAMS $1"; shift ;;
   esac
@@ -185,12 +193,32 @@ if [ -z "${domain_list:-}" ]; then
     -ef "woff,css,png,svg,jpg,woff2,jpeg,gif,svg" \
     -o "$tdir/$baseDomain-katana.log" 2>/dev/null || log "katana found no results — continuing"
 
+  ## Carry katana's raw crawled URLs (full URL incl. path/query, not just the
+  ## hostname) into gau-dirty.log too. Phase 4 (XSS) builds its candidate list
+  ## from gau-dirty.log alone, which is pure Wayback/URLScan/OTX history and
+  ## always empty for a private/non-indexed target — but katana's own crawl
+  ## (-jc) finds real parameterized endpoints there. touch first so this is
+  ## safe whether or not gau itself produced output.
+  touch "$tdir/$baseDomain-gau-dirty.log"
+  [ -f "$tdir/$baseDomain-katana.log" ] && cat "$tdir/$baseDomain-katana.log" >> "$tdir/$baseDomain-gau-dirty.log"
+
   log "Merging and deduplicating found domains"
   true > "$tdir/$baseDomain-predomains.log"
   [ -f "$tdir/$baseDomain-subLister.log" ]  && cat "$tdir/$baseDomain-subLister.log"  >> "$tdir/$baseDomain-predomains.log"
   [ -f "$tdir/$baseDomain-amass.log" ]      && cat "$tdir/$baseDomain-amass.log"      >> "$tdir/$baseDomain-predomains.log"
   [ -f "$tdir/$baseDomain-gau.log" ]        && cat "$tdir/$baseDomain-gau.log"        >> "$tdir/$baseDomain-predomains.log"
   [ -f "$tdir/$baseDomain-katana.log" ]     && awk -F/ '{print $3}' "$tdir/$baseDomain-katana.log" >> "$tdir/$baseDomain-predomains.log"
+
+  ## Explicit seed target (--seed): guarantees it survives into
+  ## uniqdomains.log/domains_only.log even if discovery found nothing for it
+  ## at all (private target, nothing publicly indexed). Additive, not a
+  ## replacement — written straight into predomains.log alongside whatever
+  ## subfinder/amass/gau/katana found, so it goes through the same
+  ## scope-filter/normalize/dedup pipeline as everything else below.
+  if [ -n "${SEED_TARGET:-}" ]; then
+    echo "$SEED_TARGET" >> "$tdir/$baseDomain-predomains.log"
+    log "Seeded explicit target: $SEED_TARGET"
+  fi
 
   ## Restrict to in-scope hosts BEFORE dedup/normalization, so out-of-scope
   ## domains (e.g. third-party links katana crawled) never enter

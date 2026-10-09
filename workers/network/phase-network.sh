@@ -49,8 +49,15 @@ log() {
   echo " █▄▄▪ [network] $1" | tee -a "$PROGRESS_LOG"
 }
 
-## Ports to scan — same set as v1
-portsIcareAbout="80,443,21,22,23,3306,8080,8443,8000,8888,9090,9443"
+## Ports to scan — same set as v1, plus a few more common web-app ports
+## (9000, 10000, 10010, 10020) that CIDR mode's web-port detection (below)
+## checks against.
+portsIcareAbout="80,443,21,22,23,3306,8080,8443,8000,8888,9090,9443,9000,10000,10010,10020"
+## Subset of the above that's actually a web port — used only in CIDR mode
+## to decide whether webscan's nuclei/dirsearch steps have anything to point
+## at (see webports.log below). Not every scanned port is a web port (22,
+## 23, 3306 aren't), so this can't just be portsIcareAbout verbatim.
+webPorts="80,443,8080,8443,9000,9090,10000,10010,10020"
 
 # ─── CIDR MODE ──────────────────────────────────────────────────────────────────
 ## IP-range scanning bypasses the domain-based pipeline entirely. Input can be
@@ -127,6 +134,28 @@ if [ -n "${cidr_input:-}" ]; then
   OPEN_PORTS=$(wc -l < "$TARGET_PREFIX-naabu.log")
   log "$OPEN_PORTS open host:port combinations found"
   log "Output: $TARGET_PREFIX-naabu.log"
+
+  ## Web-port detection: nuclei and dirsearch both accept bare ip:port
+  ## targets natively (no hostname required) — the thing CIDR mode actually
+  ## can't run is the hostname-ONLY discovery tools (subfinder/amass/gau).
+  ## So webscan's web-app steps shouldn't be unconditionally skipped in CIDR
+  ## mode; they should run IF naabu found an open port that's typically a web
+  ## service. naabu already confirmed the port is open via its own connect
+  ## scan, so no second probe (e.g. httpx) is needed here — just filter
+  ## naabu's own output down to the web-port subset.
+  WEBPORTS_FILE="$TARGET_PREFIX-webports.log"
+  : > "$WEBPORTS_FILE"
+  IFS=',' read -ra WP_ARR <<< "$webPorts"
+  for p in "${WP_ARR[@]}"; do
+    grep ":${p}\$" "$TARGET_PREFIX-naabu.log" >> "$WEBPORTS_FILE" 2>/dev/null || true
+  done
+  WEB_PORT_COUNT=$(wc -l < "$WEBPORTS_FILE")
+  if [ "$WEB_PORT_COUNT" -gt 0 ]; then
+    log "$WEB_PORT_COUNT web-port host:port combination(s) found — Output: $WEBPORTS_FILE"
+  else
+    log "No web ports among naabu's open ports — webscan will skip nuclei/dirsearch"
+  fi
+
   log "Phase complete"
   exit 0
 fi

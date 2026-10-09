@@ -37,9 +37,15 @@ structural changes.
   `hostScanDir()` in `orchestrator.js`.
 - Progress log is `<scan_dir>/kuromaku_progress.log`, written by every phase
   script via a `log()` helper with a per-phase prefix tag.
-- IP/CIDR targets skip all hostname-dependent tools entirely (no amass/
-  subfinder/gau/nuclei/dirsearch) — this is intentional, not a gap to "fix"
-  by trying to run them anyway.
+- IP/CIDR targets skip the genuinely hostname-ONLY discovery tools entirely
+  (no amass/subfinder/gau/recon/xss) — this is intentional, not a gap to
+  "fix" by trying to run them anyway. Nuclei and dirsearch are different:
+  they accept bare `ip:port` targets natively, so webscan runs them in CIDR
+  mode too, against whatever open ports the network phase's web-port
+  detection flags (`<prefix>-webports.log`, built from naabu's own open-port
+  results — see `webPorts` in `phase-network.sh` and the CIDR branch of
+  `phase-webscan.sh`). No web port found -> both stay skipped exactly as
+  before, same empty `nucleiAlerts.log`/`dirsearch.log`.
 - Multi-target IP scans come in via `kuromaku_ip_scan`. Three input shapes,
   all normalized by `runIpScan` into `<scanDir>/ip-targets.txt` with the worker
   given the container path `/workspace/scans/ip-targets.txt`:

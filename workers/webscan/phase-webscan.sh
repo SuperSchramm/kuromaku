@@ -15,7 +15,14 @@
 ## into a 49-domain scan, required hard power cycle).
 ##
 ## Tunable via environment (orchestrator may override per-project):
-##   NUCLEI_BULK_SIZE, NUCLEI_CONCURRENCY, NUCLEI_RATE_LIMIT
+##   NUCLEI_BULK_SIZE, NUCLEI_CONCURRENCY, NUCLEI_RATE_LIMIT, NUCLEI_BATCH_TIMEOUT,
+##   WEB_TARGET_CAP (CIDR mode only — caps how many ip:port web targets a single
+##   run will scan with nuclei/dirsearch; default 500)
+##
+## CIDR mode: nuclei/dirsearch run too (against bare ip:port targets) IF the
+## network phase's webports.log has any entries, built from naabu's own open-
+## port results — not skipped unconditionally like recon/xss, which actually
+## do require a hostname.
 ##
 ## Required inputs (from Phases 1-2):
 ##   <prefix>-uniqdomains.log
@@ -116,6 +123,43 @@ else
   log "Using Docker DNS resolver: $DOCKER_DNS"
 fi
 
+## CIDR mode: nuclei and dirsearch both accept bare ip:port targets natively
+## (no hostname required) — the tools that actually CAN'T run without a
+## hostname are subfinder/amass/gau (recon-phase, already skipped). So build
+## an http(s)://ip:port target list from whatever web ports the network
+## phase found open (webports.log — see phase-network.sh), instead of
+## unconditionally skipping nuclei/dirsearch for every CIDR scan. Built once
+## here, used by both the nuclei and dirsearch sections below.
+WEB_TARGETS_FILE="$TARGET_PREFIX-web-targets.log"
+if [ -n "${cidr_input:-}" ]; then
+  WEBPORTS_FILE="$TARGET_PREFIX-webports.log"
+  : > "$WEB_TARGETS_FILE"
+  if [ -s "$WEBPORTS_FILE" ]; then
+    while IFS= read -r hostport; do
+      [ -z "$hostport" ] && continue
+      port="${hostport##*:}"
+      case "$port" in
+        443|8443|9443|10010) scheme="https" ;;
+        *) scheme="http" ;;
+      esac
+      echo "${scheme}://${hostport}" >> "$WEB_TARGETS_FILE"
+    done < "$WEBPORTS_FILE"
+
+    ## Resource-cap note (CLAUDE.md): nuclei against many ip:port targets is
+    ## just as RAM-heavy as the domain-mode run that already needed 3-way
+    ## batching to avoid a full system lockup. A large CIDR range with lots
+    ## of open web ports could multiply that out badly, so cap how many
+    ## targets a single CIDR webscan run will throw at nuclei/dirsearch.
+    WEB_TARGET_CAP=${WEB_TARGET_CAP:-500}
+    WEB_TARGET_COUNT=$(wc -l < "$WEB_TARGETS_FILE")
+    if [ "$WEB_TARGET_COUNT" -gt "$WEB_TARGET_CAP" ]; then
+      log "WARNING: $WEB_TARGET_COUNT web target(s) found, capping to $WEB_TARGET_CAP (set WEB_TARGET_CAP to override) to avoid overloading nuclei/dirsearch"
+      head -n "$WEB_TARGET_CAP" "$WEB_TARGETS_FILE" > "$WEB_TARGETS_FILE.capped"
+      mv "$WEB_TARGETS_FILE.capped" "$WEB_TARGETS_FILE"
+    fi
+  fi
+fi
+
 # ─── Nuclei Vulnerability Scan ──────────────────────────────────────────────────
 ## Resource-constrained default (8GB Mac Mini M4): nuclei is the heaviest single
 ## consumer in this phase. Splitting into smaller sequential tag batches with
@@ -129,22 +173,23 @@ NUCLEI_RATE_LIMIT=${NUCLEI_RATE_LIMIT:-25}
 ## already written to the batch file are kept.
 NUCLEI_BATCH_TIMEOUT=${NUCLEI_BATCH_TIMEOUT:-2700}
 
-if [ -n "${cidr_input:-}" ]; then
-  log "CIDR mode — skipping nuclei (no hostnames)"
-  touch "$TARGET_PREFIX-nucleiAlerts.log"
-elif [ "$SKIP_NUCLEI" -eq 0 ]; then
-  log "Passing to Nuclei (batched — bulk-size=$NUCLEI_BULK_SIZE concurrency=$NUCLEI_CONCURRENCY rate-limit=$NUCLEI_RATE_LIMIT)"
-  ## nuclei's -r flag expects a FILE PATH containing resolver IPs (one per line),
-  ## unlike dnsx/naabu which accept inline comma-separated IPs.
-  RESOLVER_FILE="/tmp/resolvers.txt"
-  echo "$DOCKER_DNS" | tr ',' '\n' > "$RESOLVER_FILE"
+## Runs the 3 resource-capped nuclei tag batches against $1 (a target list —
+## hostnames for domain mode, ip:port URLs for CIDR mode), accumulating
+## results into $TARGET_PREFIX-nucleiAlerts.log. Any args after $1 are passed
+## straight through to nuclei (domain mode adds -r <resolver file>; CIDR mode
+## passes nothing extra — raw IPs need no DNS resolution). Same batching/
+## heartbeat/timeout pattern for both modes — do not revert to one unbatched
+## run (CLAUDE.md: caused a full system lockup once).
+run_nuclei_batches() {
+  local target_list="$1"; shift
+  local extra_args=("$@")
 
   true > "$TARGET_PREFIX-nuclei.log"
 
   # Three smaller batches instead of one 10-tag run — each batch completes and
   # logs progress independently, so a kill/OOM mid-run loses at most one batch
   # worth of work rather than the entire phase's nuclei output.
-  NUCLEI_BATCHES=(
+  local NUCLEI_BATCHES=(
     "dns,cve,exposure"
     "tech,misconfig,default-login"
     "network,takeover,panel,vuln"
@@ -164,7 +209,7 @@ elif [ "$SKIP_NUCLEI" -eq 0 ]; then
     ## -stats + -stats-interval prints periodic progress (% complete, req/sec,
     ## hosts scanned) to stderr. Redirecting 2>&1 into the progress log gives a
     ## real-time view of nuclei's actual progress, not just a heartbeat.
-    timeout "$NUCLEI_BATCH_TIMEOUT" nuclei -l "$UNIQ_DOMAINS_FILE" \
+    timeout "$NUCLEI_BATCH_TIMEOUT" nuclei -l "$target_list" \
       -tags "$batch_tags" \
       -etags "dos,fuzz,intrusive" \
       -severity "critical,high,medium" \
@@ -173,7 +218,7 @@ elif [ "$SKIP_NUCLEI" -eq 0 ]; then
       -concurrency "$NUCLEI_CONCURRENCY" \
       -timeout 10 \
       -retries 2 \
-      -r "$RESOLVER_FILE" \
+      "${extra_args[@]}" \
       -stats \
       -stats-interval 15 \
       -silent \
@@ -200,6 +245,24 @@ elif [ "$SKIP_NUCLEI" -eq 0 ]; then
 
   NUCLEI_FINDINGS=$(wc -l < "$TARGET_PREFIX-nucleiAlerts.log")
   log "$NUCLEI_FINDINGS total nuclei findings. Output: $TARGET_PREFIX-nucleiAlerts.log"
+}
+
+if [ -n "${cidr_input:-}" ]; then
+  if [ -s "$WEB_TARGETS_FILE" ]; then
+    WEB_TARGET_COUNT=$(wc -l < "$WEB_TARGETS_FILE")
+    log "CIDR mode — $WEB_TARGET_COUNT web target(s) found (bulk-size=$NUCLEI_BULK_SIZE concurrency=$NUCLEI_CONCURRENCY rate-limit=$NUCLEI_RATE_LIMIT), running nuclei"
+    run_nuclei_batches "$WEB_TARGETS_FILE"
+  else
+    log "CIDR mode — no web ports found among naabu's open ports, skipping nuclei"
+    touch "$TARGET_PREFIX-nucleiAlerts.log"
+  fi
+elif [ "$SKIP_NUCLEI" -eq 0 ]; then
+  log "Passing to Nuclei (batched — bulk-size=$NUCLEI_BULK_SIZE concurrency=$NUCLEI_CONCURRENCY rate-limit=$NUCLEI_RATE_LIMIT)"
+  ## nuclei's -r flag expects a FILE PATH containing resolver IPs (one per line),
+  ## unlike dnsx/naabu which accept inline comma-separated IPs.
+  RESOLVER_FILE="/tmp/resolvers.txt"
+  echo "$DOCKER_DNS" | tr ',' '\n' > "$RESOLVER_FILE"
+  run_nuclei_batches "$UNIQ_DOMAINS_FILE" -r "$RESOLVER_FILE"
 else
   log "Skipping nuclei (--skip-nuclei)"
   touch "$TARGET_PREFIX-nucleiAlerts.log"
@@ -267,12 +330,22 @@ fi
 
 # ─── Dirsearch Brute Force ────────────────────────────────────────────────────────
 if [ -n "${cidr_input:-}" ]; then
-  log "CIDR mode — skipping dirsearch (no hostnames)"
-  touch "$TARGET_PREFIX-dirsearch.log"
+  if [ -s "$WEB_TARGETS_FILE" ]; then
+    log "CIDR mode — running dirsearch against $(wc -l < "$WEB_TARGETS_FILE") web target(s)"
+    DIRSEARCH_TARGETS="$WEB_TARGETS_FILE"
+  else
+    log "CIDR mode — no web ports found among naabu's open ports, skipping dirsearch"
+    touch "$TARGET_PREFIX-dirsearch.log"
+    DIRSEARCH_TARGETS=""
+  fi
 else
   log "Directory brute-force with dirsearch"
+  DIRSEARCH_TARGETS="$UNIQ_DOMAINS_FILE"
+fi
+
+if [ -n "$DIRSEARCH_TARGETS" ]; then
   ## Try modern flag first, fall back to older --output flag if version mismatch
-  dirsearch -l "$UNIQ_DOMAINS_FILE" \
+  dirsearch -l "$DIRSEARCH_TARGETS" \
     --exclude-status="$returnCodes2Ignore" \
     -e php,asp,aspx,jsp,html,js,json,xml,conf,config,bak,old,txt \
     -f \
@@ -280,7 +353,7 @@ else
     -o "$TARGET_PREFIX-dirsearch.log" \
     --format=plain \
     --quiet 2>/dev/null || \
-  dirsearch -l "$UNIQ_DOMAINS_FILE" \
+  dirsearch -l "$DIRSEARCH_TARGETS" \
     --exclude-status="$returnCodes2Ignore" \
     -e php,asp,aspx,jsp,html,js,json,xml,conf,config,bak,old,txt \
     -f \

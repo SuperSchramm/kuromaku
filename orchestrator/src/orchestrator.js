@@ -119,6 +119,9 @@ function buildDockerArgs(phase, scanDir, opts) {
     // container, so just reference it by basename under that mount.
     args.push("--scope-file", `/workspace/scans/${path.basename(opts.scope_file)}`);
   }
+  if (phase === "recon" && opts.target_url) {
+    args.push("--seed", opts.target_url);
+  }
   if (phase === "webscan" && opts.skip_nuclei) {
     args.push("--skip-nuclei");
   }
