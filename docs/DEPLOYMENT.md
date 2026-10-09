@@ -127,7 +127,7 @@ cd workers/network  && docker build -t kuromaku-network .  && cd ..
 cd workers/webscan  && docker build -t kuromaku-webscan .  && cd ..
 cd workers/xss      && docker build -t kuromaku-xss .      && cd ..
 cd workers/report   && docker build -t kuromaku-report .   && cd ..
-cd workers/orchestrator && docker build -t kuromaku-orchestrator . && cd ..
+cd orchestrator && docker build -t kuromaku-orchestrator . && cd ..
 ```
 
 **Build times**: `recon`, `network`, and `xss` are quick (Go binaries on
@@ -287,7 +287,7 @@ a different `-e RESOURCE_PROFILE=...` value (§4.2). This affects all
 original settings until that phase finishes or is stopped/resumed.
 
 If you need something between `low` and `high` (e.g. a `medium` profile),
-edit the `PROFILES` table in `workers/orchestrator/src/orchestrator.js` and
+edit the `PROFILES` table in `orchestrator/src/orchestrator.js` and
 rebuild the orchestrator image (`docker build --no-cache -t
 kuromaku-orchestrator .`).
 
