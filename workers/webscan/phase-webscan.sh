@@ -322,9 +322,23 @@ if [ "$HOST_COUNT" -gt 0 ]; then
     done ) &
   NMAP_HEARTBEAT_PID=$!
 
+  # vulners.nse's rate limit is much lower (and result set smaller) on the
+  # unauthenticated/free tier — an API key raises both. NEVER hardcode a key
+  # here; VULNERS_API_KEY is forwarded from the orchestrator's own
+  # environment only if set (see buildDockerArgs in orchestrator.js) and
+  # must never be committed. Logged as present/absent, never the value.
+  NMAP_SCRIPT_ARGS=()
+  if [ -n "${VULNERS_API_KEY:-}" ]; then
+    NMAP_SCRIPT_ARGS=(--script-args "vulners.apikey=${VULNERS_API_KEY}")
+    log "vulners: using API key (rate limit / result set raised)"
+  else
+    log "vulners: no API key set — unauthenticated rate limit applies"
+  fi
+
   # -oN writes the report to the file; stdout (incl. --stats-every progress) is
   # tagged into the progress log for live visibility.
   nmap -sV --script vulners \
+       "${NMAP_SCRIPT_ARGS[@]}" \
        --open \
        -Pn \
        -T4 \

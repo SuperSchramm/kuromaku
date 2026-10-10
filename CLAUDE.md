@@ -61,6 +61,16 @@ structural changes.
   (via the mounted socket), so `-v` mount paths must be host-side paths, not
   the orchestrator container's internal `/workspace/projects` path. See
   `hostScanDir()` in `orchestrator.js`.
+- Secrets (API keys — `VULNERS_API_KEY` currently, raises `vulners.nse`'s
+  rate limit in the webscan phase) are env vars on the orchestrator
+  container ONLY, forwarded to the specific worker that needs them via
+  `-e` in `buildDockerArgs` only when `process.env.<NAME>` is actually set
+  — never hardcoded, never written into a checkpoint/options object (those
+  are JSON on disk, not secrets-safe), never logged. `.env.example`
+  documents the full list; the real `.env` is gitignored. Follow this exact
+  pattern for any future key — don't add one to `PROFILES`' `env` blocks in
+  `orchestrator.js` (those ARE committed, tuning knobs only) or to a
+  checkpoint's `options`.
 - Progress log is `<scan_dir>/kuromaku_progress.log`, written by every phase
   script via a `log()` helper with a per-phase prefix tag.
 - IP/CIDR targets skip the genuinely hostname-ONLY discovery tools entirely

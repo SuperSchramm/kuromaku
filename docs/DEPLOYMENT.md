@@ -213,6 +213,26 @@ docker run -d --name kuromaku-orchestrator --restart unless-stopped `
 > `/var/run/docker.sock` (single slash) — Docker Desktop's path handling for
 > the socket varies slightly by version.
 
+#### Optional secrets (API keys)
+
+For anything that's a secret rather than a tuning knob — e.g. `VULNERS_API_KEY`
+(raises `vulners.nse`'s rate limit on the webscan phase's nmap run; see
+`.env.example` for the full list) — don't put it in a committed file or a
+shell history-visible `-e` flag you'd paste into a chat or a script. Copy
+`.env.example` to `.env` (already gitignored) and add `--env-file .env` to
+the `docker run` command above instead:
+
+```bash
+docker run -d --name kuromaku-orchestrator --restart unless-stopped \
+  --env-file .env \
+  -e MCP_HTTP=true \
+  ...
+```
+
+These are read from the orchestrator's own environment and forwarded to the
+relevant worker container only when set — never hardcoded, never written
+into a checkpoint/options JSON file on disk.
+
 ### 4.3 Verify It's Running
 
 ```bash

@@ -132,6 +132,15 @@ function buildDockerArgs(phase, scanDir, opts) {
   if (phase === "webscan" && opts.skip_nuclei) {
     args.push("--skip-nuclei");
   }
+  if (phase === "webscan" && process.env.VULNERS_API_KEY) {
+    // Forwarded from the ORCHESTRATOR's own environment only — never
+    // hardcoded, never written to a checkpoint/options object (those get
+    // written to disk as JSON and are not secrets-safe), never logged here.
+    // Set VULNERS_API_KEY on the orchestrator container itself (same place
+    // as RESOURCE_PROFILE/HOST_PROJECTS_DIR) to use it; phase-webscan.sh
+    // picks it up and passes it to nmap's vulners.nse via --script-args.
+    args.push("-e", `VULNERS_API_KEY=${process.env.VULNERS_API_KEY}`);
+  }
   if (phase === "report") {
     if (opts.llm_url) args.push("--llm-url", opts.llm_url);
     if (opts.llm_model) args.push("--llm-model", opts.llm_model);
