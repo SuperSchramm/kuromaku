@@ -16,6 +16,14 @@
 ##   <prefix>-uniqdomains.log
 ##   <prefix>-domains_only.log
 ## where <prefix> = domain (or basename of domain_list)
+##
+## Tunable via environment: AMASS_TIMEOUT (minutes, default 10) — amass's
+## own -timeout flag (amass enum's unit is minutes, not seconds). A bad/slow
+## passive source can otherwise hang amass indefinitely with no feedback;
+## this bounds the whole `amass enum` call, same intent as nuclei's
+## NUCLEI_BATCH_TIMEOUT in phase-webscan.sh. Not to be confused with the
+## `-timeout 10` a few lines below on the httpx call right after it — that's
+## httpx's own per-request timeout in SECONDS, a different flag entirely.
 
 set -uo pipefail
 
@@ -42,6 +50,7 @@ done
 eval set -- "$PARAMS"
 
 THREADS=${THREADS:-50}
+AMASS_TIMEOUT=${AMASS_TIMEOUT:-10}
 
 if [ -z "${baseDomain:-}" ] && [ -z "${domain_list:-}" ]; then
   echo "Error: -d <domain> or -dl <domain_list> is required" >&2
@@ -155,8 +164,8 @@ if [ -z "${domain_list:-}" ]; then
             -title -tech-detect -status-code \
             -o "$tdir/$baseDomain-subLister.log"
 
-  log "Passing to Amass"
-  amass enum -passive -d "$baseDomain" \
+  log "Passing to Amass (timeout ${AMASS_TIMEOUT}m)"
+  amass enum -passive -d "$baseDomain" -timeout "$AMASS_TIMEOUT" \
     | httpx -silent -follow-redirects -fc "$returnCodes2Ignore" \
             -timeout 10 -threads "$THREADS" \
             -o "$tdir/$baseDomain-amass.log"
