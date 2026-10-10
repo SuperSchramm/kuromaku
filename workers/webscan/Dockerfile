@@ -14,13 +14,25 @@ RUN apk add --no-cache \
     nmap nmap-scripts \
     python3 py3-pip python3-dev \
     git gcc musl-dev libffi-dev openssl-dev \
-    jq
+    jq \
+    sed
+# "sed" above is GNU sed, not Alpine's built-in BusyBox sed applet — needed
+# for -u (unbuffered), which BusyBox sed doesn't support ("sed: unrecognized
+# option: u"). phase-webscan.sh relies on -u for live nuclei progress output.
 
 # ─── nuclei ─────────────────────────────────────────────────────────────────────
 COPY --from=builder /go/bin/nuclei /usr/local/bin/nuclei
 
-# Pre-download nuclei templates at build time so first scan doesn't pay the cost
-RUN nuclei -update-templates -silent 2>/dev/null || true
+# Pre-download the full nuclei-templates set at build time — phase-webscan.sh
+# scans across all 14 top-level template categories (dns/iot/cves/
+# technologies/exposures/fuzzing/miscellaneous/misconfiguration/default-
+# logins/network/headless/takeovers/exposed-panels/vulnerabilities), so this
+# is required, not a nice-to-have — `-silent ... || true` previously
+# swallowed a failed download silently, which would ship an image with ZERO
+# templates and every future scan would silently find nothing for every -t
+# directory, forever, with no error anywhere. Now fails the build loudly (and
+# shows real output) if the fetch doesn't succeed, instead of shipping broken.
+RUN nuclei -update-templates
 
 # ─── nmap vulners script ────────────────────────────────────────────────────────
 # vulners NSE script is not bundled with apk nmap-scripts — fetch manually

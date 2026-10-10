@@ -173,36 +173,54 @@ NUCLEI_RATE_LIMIT=${NUCLEI_RATE_LIMIT:-25}
 ## already written to the batch file are kept.
 NUCLEI_BATCH_TIMEOUT=${NUCLEI_BATCH_TIMEOUT:-2700}
 
-## Runs the 3 resource-capped nuclei tag batches against $1 (a target list —
-## hostnames for domain mode, ip:port URLs for CIDR mode), accumulating
-## results into $TARGET_PREFIX-nucleiAlerts.log. Any args after $1 are passed
-## straight through to nuclei (domain mode adds -r <resolver file>; CIDR mode
-## passes nothing extra — raw IPs need no DNS resolution). Same batching/
-## heartbeat/timeout pattern for both modes — do not revert to one unbatched
-## run (CLAUDE.md: caused a full system lockup once).
+## Runs resource-capped nuclei batches against $1 (a target list — hostnames
+## for domain mode, ip:port URLs for CIDR mode), accumulating results into
+## $TARGET_PREFIX-nucleiAlerts.log. Any args after $1 are passed straight
+## through to nuclei (domain mode adds -r <resolver file>; CIDR mode passes
+## nothing extra — raw IPs need no DNS resolution). Same batching/heartbeat/
+## timeout pattern for both modes — do not revert to one unbatched run
+## (CLAUDE.md: caused a full system lockup once).
+##
+## Batches by TEMPLATE DIRECTORY (-t <dir>/), not -tags — full coverage
+## across all 14 of nuclei-templates' top-level categories, matching the
+## breadth of the pre-kuromaku bash workflow this replaced (deliberately NOT
+## narrowed by -severity or -etags either: directories like technologies/
+## and exposed-panels/ are dominated by info/low-severity findings that a
+## severity filter would have silently thrown away, defeating the point of
+## including them). This is intentionally slow and thorough, not a quick
+## scan — expect nuclei to be the long pole in webscan again, same as the
+## original script.
 run_nuclei_batches() {
   local target_list="$1"; shift
   local extra_args=("$@")
 
   true > "$TARGET_PREFIX-nuclei.log"
 
-  # Three smaller batches instead of one 10-tag run — each batch completes and
-  # logs progress independently, so a kill/OOM mid-run loses at most one batch
-  # worth of work rather than the entire phase's nuclei output.
+  # Grouped into batches (not one unbatched run across all 14 dirs) so a
+  # kill/OOM/timeout mid-run loses at most one batch worth of work, and the
+  # progress log gets incremental updates instead of one multi-hour black box.
   local NUCLEI_BATCHES=(
-    "dns,cve,exposure"
-    "tech,misconfig,default-login"
-    "network,takeover,panel,vuln"
+    "dns cves exposures"
+    "technologies misconfiguration default-logins"
+    "network takeovers exposed-panels"
+    "iot fuzzing miscellaneous"
+    "headless vulnerabilities"
   )
 
-  for batch_tags in "${NUCLEI_BATCHES[@]}"; do
-    log "Nuclei batch: $batch_tags"
+  for batch_dirs in "${NUCLEI_BATCHES[@]}"; do
+    local batch_label="${batch_dirs// /,}"
+    log "Nuclei batch: $batch_label"
+
+    local TEMPLATE_ARGS=()
+    for d in $batch_dirs; do
+      TEMPLATE_ARGS+=(-t "${d}/")
+    done
 
     # Heartbeat fallback — guarantees a progress-log line every 60s even if
     # nuclei's own -stats output stalls on a slow host. Killed once nuclei exits.
     ( while true; do
         sleep 60
-        echo " █▄▄▪ [webscan] heartbeat — nuclei batch '$batch_tags' still running, $(date +%H:%M:%S), $(wc -l < "$TARGET_PREFIX-nuclei-batch.log" 2>/dev/null || echo 0) findings so far" | tee -a "$PROGRESS_LOG"
+        echo " █▄▄▪ [webscan] heartbeat — nuclei batch '$batch_label' still running, $(date +%H:%M:%S), $(wc -l < "$TARGET_PREFIX-nuclei-batch.log" 2>/dev/null || echo 0) findings so far" | tee -a "$PROGRESS_LOG"
       done ) &
     HEARTBEAT_PID=$!
 
@@ -210,9 +228,7 @@ run_nuclei_batches() {
     ## hosts scanned) to stderr. Redirecting 2>&1 into the progress log gives a
     ## real-time view of nuclei's actual progress, not just a heartbeat.
     timeout "$NUCLEI_BATCH_TIMEOUT" nuclei -l "$target_list" \
-      -tags "$batch_tags" \
-      -etags "dos,fuzz,intrusive" \
-      -severity "critical,high,medium" \
+      "${TEMPLATE_ARGS[@]}" \
       -rate-limit "$NUCLEI_RATE_LIMIT" \
       -bulk-size "$NUCLEI_BULK_SIZE" \
       -concurrency "$NUCLEI_CONCURRENCY" \
@@ -223,20 +239,20 @@ run_nuclei_batches() {
       -stats-interval 15 \
       -silent \
       -o "$TARGET_PREFIX-nuclei-batch.log" 2>&1 | \
-      sed -u "s/^/ █▄▄▪ [webscan] [nuclei:$batch_tags] /" | tee -a "$PROGRESS_LOG"
+      sed -u "s/^/ █▄▄▪ [webscan] [nuclei:$batch_label] /" | tee -a "$PROGRESS_LOG"
 
     NUCLEI_RC=${PIPESTATUS[0]}
     kill "$HEARTBEAT_PID" 2>/dev/null
     wait "$HEARTBEAT_PID" 2>/dev/null
     if [ "$NUCLEI_RC" -eq 143 ] || [ "$NUCLEI_RC" -eq 124 ]; then
-      log "Batch '$batch_tags' hit the ${NUCLEI_BATCH_TIMEOUT}s timeout — keeping partial findings, moving on"
+      log "Batch '$batch_label' hit the ${NUCLEI_BATCH_TIMEOUT}s timeout — keeping partial findings, moving on"
     fi
 
     if [ -f "$TARGET_PREFIX-nuclei-batch.log" ]; then
       cat "$TARGET_PREFIX-nuclei-batch.log" >> "$TARGET_PREFIX-nuclei.log"
       BATCH_COUNT=$(wc -l < "$TARGET_PREFIX-nuclei-batch.log")
       rm "$TARGET_PREFIX-nuclei-batch.log"
-      log "Batch '$batch_tags' complete — $BATCH_COUNT findings"
+      log "Batch '$batch_label' complete — $BATCH_COUNT findings"
     fi
   done
 

@@ -72,10 +72,17 @@ structural changes.
   `orchestrator.js` (basename-vs-string rule must match the worker), and
   `phase-network.sh`'s CIDR branch (copies the file's *contents* into
   `unique-ips.log`, never the path string).
-- Nuclei runs in resource-capped batches (3 tag groups), each with its own
-  heartbeat + `-stats` output piped into the progress log — do not revert to
-  one unbatched run; it caused a full system lockup once on constrained
-  hardware.
+- Nuclei runs in resource-capped batches (5 groups, batched by template
+  *directory* — `-t <dir>/`, covering all 14 of nuclei-templates' top-level
+  categories: dns/iot/cves/technologies/exposures/fuzzing/miscellaneous/
+  misconfiguration/default-logins/network/headless/takeovers/exposed-panels/
+  vulnerabilities — not by `-tags`, and deliberately not narrowed by
+  `-severity`/`-etags` either, since directories like technologies/ are
+  dominated by info-severity findings a severity filter would just discard),
+  each with its own heartbeat + `-stats` output piped into the progress log
+  — do not revert to one unbatched run; it caused a full system lockup once
+  on constrained hardware. This is intentionally slow/thorough, not a quick
+  scan.
 
 ## When editing
 
