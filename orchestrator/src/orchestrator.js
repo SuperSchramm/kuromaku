@@ -90,6 +90,13 @@ function buildDockerArgs(phase, scanDir, opts) {
     "--memory", profile.memory,
     "--memory-swap", profile.memory, // no swap beyond the memory limit
     "-v", `${hostScanDir(scanDir)}:/workspace/scans`,
+    // report's default --llm-url points at http://host.docker.internal:1234
+    // (LM Studio on the host). Docker Desktop usually resolves that name
+    // automatically via its embedded DNS, but not reliably in every
+    // version/backend (observed failing here: "Name does not resolve").
+    // --add-host with the host-gateway sentinel (Docker 20.10+) makes it
+    // resolve explicitly regardless — harmless on phases that never use it.
+    "--add-host", "host.docker.internal:host-gateway",
   ];
 
   for (const capName of profile.caps) {
