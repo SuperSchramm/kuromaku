@@ -1,0 +1,29 @@
+# Default gau config, baked into the kuromaku-recon image at /root/.gau.toml
+# so gau stops warning "Config file /root/.gau.toml not found, using default
+# config" on every recon run. This is gau's own documented default schema —
+# the values here ARE what gau falls back to anyway when no file exists, just
+# made explicit instead of implicit.
+#
+# phase-recon.sh's own CLI flags (--blacklist, --retries, --subs) take
+# precedence over the matching fields below — this file only governs what
+# ISN'T passed as a flag (providers queried, thread count, etc).
+threads = 10
+verbose = false
+retries = 15
+subdomains = false
+parameters = false
+json = false
+providers = ["wayback", "commoncrawl", "otx", "urlscan"]
+blacklist = []
+proxy = ""
+
+[urlscan]
+  apikey = ""
+
+[filters]
+  from = ""
+  to = ""
+  matchstatuscodes = []
+  matchmimetypes = []
+  filterstatuscodes = []
+  filtermimetypes = []

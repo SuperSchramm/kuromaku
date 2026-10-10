@@ -44,6 +44,11 @@ RUN cp /tmp/gobin/amass* /usr/local/bin/amass 2>/dev/null || \
 COPY phase-recon.sh /usr/local/bin/phase-recon.sh
 RUN chmod +x /usr/local/bin/phase-recon.sh
 
+# gau's own default config, explicit — otherwise gau logs a warning every
+# run ("Config file /root/.gau.toml not found, using default config").
+# Container runs as root (no USER directive), hence /root/.gau.toml.
+COPY gau.toml /root/.gau.toml
+
 WORKDIR /workspace
 
 ENTRYPOINT ["/usr/local/bin/phase-recon.sh"]
