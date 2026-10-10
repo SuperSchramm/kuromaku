@@ -95,6 +95,8 @@ Parameters marked **required** must be supplied; everything else is optional.
 | `skip_nuclei` | boolean | `false` | Skip nuclei in the webscan phase. |
 | `llm_url` | string | — | LM Studio OpenAI-compatible URL for the report's executive summary. |
 | `llm_model` | string | — | Model name for the executive summary. Without `llm_url`/`llm_model` a templated summary is used. |
+| `team_name` | string | `"Kuromaku Security Assessment"` | Team/organization name on the report's title page and narrative sections. |
+| `client_name` | string | `"<CLIENT NAME>"` | Client/target organization name on the report's title page, confidentiality notice, and findings narrative. Left as a literal placeholder if omitted, so it's obvious in the output that it still needs filling in. |
 | `scope` | string[] | — | In-scope glob patterns (`example.com` = exact host, `*.example.com` = subdomains only, not the apex). The target itself is not auto-included. Out-of-scope discoveries are dropped before network/webscan/xss (saved to `out-of-scope.log`, see below) — never scanned, never silently added back. If omitted entirely, the response warns that recon's crawl (gau/katana) commonly pulls in unrelated third-party domains that will then be scanned downstream too. |
 | `target_url` | string | — | Explicit `host[:port]` guaranteed to survive into `uniqdomains.log` even if subfinder/amass/gau/katana find nothing for it. For a private/internal target (nothing publicly indexed) or one on a non-standard port (katana's own crawl always hits `https://<domain>`, so a plain-HTTP or non-443 target otherwise never gets probed). Additive — normal discovery still runs. |
 
@@ -223,6 +225,44 @@ If `scope` is omitted entirely, `kuromaku_run`/`kuromaku_resume` return a
 warning asking you to confirm that's intentional — that's the one case worth
 catching before the scan runs, since without any scope list nothing gets
 filtered and recon's noise goes straight into network/webscan/xss.
+
+## Report format
+
+`<prefix>-report.docx` is rendered from `workers/report/assets/report-template.docx`
+(a CCSO-style assessment report) via `docxtpl`, not built up from scratch —
+title page, severity table, Scope > Networks (from `scope`), Classification
+Definitions, per-finding detail, Appendix A (Tools Used), all templated.
+
+Per-finding **Risk Score**, **Exploitation Likelihood**, and **Business
+Impact** are derived from nuclei's own CVSS data (score + vector), aligned
+with [Bugcrowd's Vulnerability Rating Taxonomy](https://bugcrowd.com/vulnerability-rating-taxonomy)
+terminology — not an LLM guess or an invented heuristic. A finding with no
+CVSS vector (common for non-CVE templates: exposures/misconfiguration/
+technologies/etc.) falls back to the template's own documented severity
+scale (Critical=10, High=7-9, Medium=4-6, Low=1-3, Informational=0).
+**Remediation Difficulty is deliberately not included** — unlike CVSS-
+derivable fields, it depends on the target's own infrastructure (in-house
+skills, hardware/budget, change-control process) that an external scan has
+no way to know; fabricating it would be worse than leaving it out.
+
+The Executive Summary, Testing Methodology description, and severity counts
+are populated from the scan's actual data (and the existing LLM call, with
+its templated fallback, for the Executive Summary narrative specifically).
+**Observed Security Strengths and Recommendations are intentionally left as
+structure only** (headings + intro text, no auto-generated bullet points) —
+these require real analyst judgment an automated scanner has no basis to
+fabricate; same reasoning as dropping Remediation Difficulty.
+
+This requires `nuclei`'s output to be JSON Lines (`-jsonl` — see
+`phase-webscan.sh`), not the old plain-text format. `kuromaku_results`/
+`kuromaku_report` pretty-print `nucleiAlerts.log` back to a readable
+one-line-per-finding summary for chat; the file on disk is JSONL.
+
+If `docxtpl`, the template asset, or `python-docx` aren't available, or the
+templated render fails for any reason, the report phase automatically falls
+back to kuromaku's original flat-summary DOCX format — the report phase
+never fails outright just because the richer format couldn't be built. Pass
+`--legacy` directly to `phase-report.py` to force that fallback.
 
 ## Authorization
 

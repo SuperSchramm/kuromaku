@@ -34,10 +34,25 @@ structural changes.
   only dedupes the *same* project) — looping `kuromaku_run` yourself for a
   domain list risks exactly the resource-overload scenario nuclei's own
   batching below exists to avoid.
-- `workers/report/phase-report.py` — DOCX report generation (python-docx),
-  modeled on a reference report format; LLM call for the executive summary
-  is optional (falls back to a templated summary if no `llm_url`/`llm_model`
-  given).
+- `workers/report/phase-report.py` — DOCX report generation. Default path
+  renders `workers/report/assets/report-template.docx` (a CCSO-style
+  assessment report) via `docxtpl`; per-finding Risk Score/Exploitation
+  Likelihood/Business Impact come from nuclei's own CVSS data (vector +
+  score), Bugcrowd-VRT-aligned, not fabricated — see README's "Report
+  format" section for the full reasoning, including why Remediation
+  Difficulty and Strengths/Recommendations bullet points are deliberately
+  left out rather than invented. Falls back automatically to the original
+  flat-summary format (`build_legacy_report`, still python-docx) if
+  `docxtpl`/the template asset/`python-docx` are unavailable or the
+  templated render throws for any reason — the phase must never fail
+  outright over the richer format. `workers/report/assets/tools/
+  prepare_template.py` is the one-time maintenance script that turned the
+  source CCSO docx into the Jinja-tagged template asset; it's not part of
+  the runtime pipeline, only needed again if the template itself changes.
+  LLM call for the executive summary is optional (falls back to a
+  templated summary if no `llm_url`/`llm_model` given, or if
+  `host.docker.internal` doesn't resolve — see the `--add-host` note
+  above).
 
 ## Conventions to preserve
 
@@ -82,7 +97,12 @@ structural changes.
   each with its own heartbeat + `-stats` output piped into the progress log
   — do not revert to one unbatched run; it caused a full system lockup once
   on constrained hardware. This is intentionally slow/thorough, not a quick
-  scan.
+  scan. Output is JSON Lines (`-jsonl`), not nuclei's old plain-text format
+  — `nucleiAlerts.log` on disk is JSONL (needed for the report's CVSS-
+  derived scoring); `kuromaku_results`/`kuromaku_report` pretty-print it
+  back to a readable one-line-per-finding summary (`prettyPrintNucleiJsonl`
+  in `index.js`) for chat, but don't assume the raw file is plain text
+  anymore if you're reading it directly.
 
 ## When editing
 

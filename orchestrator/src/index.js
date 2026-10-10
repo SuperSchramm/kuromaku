@@ -179,6 +179,8 @@ const TOOL_LIST = [
         skip_nuclei: { type: "boolean", default: false },
         llm_url: { type: "string", description: "LM Studio OpenAI-compatible URL for report exec summary" },
         llm_model: { type: "string", description: "Model name for report exec summary" },
+        team_name: { type: "string", description: "Team/organization name shown on the report's title page and in its narrative sections (e.g. 'Acme Security'). Defaults to a generic 'Kuromaku Security Assessment' label if omitted." },
+        client_name: { type: "string", description: "Client/target organization name shown on the report's title page, confidentiality notice, and findings narrative. Left as a literal '<CLIENT NAME>' placeholder if omitted, so it's obvious in the output that it still needs filling in." },
         target_url: {
           type: "string",
           description:
@@ -393,6 +395,8 @@ const TOOL_LIST = [
         skip_nuclei: { type: "boolean", default: false },
         llm_url: { type: "string", description: "LM Studio OpenAI-compatible URL for each target's report exec summary" },
         llm_model: { type: "string", description: "Model name for each target's report exec summary" },
+        team_name: { type: "string", description: "Team/organization name shown on every target's report title page, applied uniformly across the batch." },
+        client_name: { type: "string", description: "Client/target organization name shown on every target's report, applied uniformly across the batch. Leave unset for a multi-company list (e.g. a VDP scope table) where there's no single 'client' name that applies to every target." },
         force: { type: "boolean", default: false, description: "If batch_id already has a manifest, discard it and start fresh from the newly supplied targets/targets_file instead of resuming." },
       },
       required: ["batch_id"],
@@ -499,6 +503,27 @@ const FILE_LABELS = {
 // Walk the output files for a project and split them into sections that have
 // data vs. files that are empty/absent. The binary DOCX report is referenced
 // by path rather than inlined.
+// nucleiAlerts.log is JSON Lines (nuclei runs with -jsonl — see
+// phase-webscan.sh / CLAUDE.md) — raw JSON blobs aren't readable in a chat
+// reply, so render a one-line-per-finding summary instead, same spirit as
+// nuclei's own old plain-text output format. Shared by kuromaku_results and
+// kuromaku_report (assembleReport) so the two can't drift apart.
+function prettyPrintNucleiJsonl(content) {
+  const lines = content.split("\n").map((l) => l.trim()).filter(Boolean);
+  const pretty = lines.map((line) => {
+    try {
+      const rec = JSON.parse(line);
+      const info = rec.info || {};
+      const sev = (info.severity || "info").toUpperCase();
+      const cvss = info.classification && info.classification["cvss-score"];
+      return `[${sev}] ${rec["template-id"] || "?"} — ${rec["matched-at"] || rec.host || "?"}${cvss != null ? ` (CVSS ${cvss})` : ""}`;
+    } catch {
+      return line; // not JSON (shouldn't happen with -silent -jsonl) — show raw
+    }
+  });
+  return pretty.join("\n");
+}
+
 function assembleReport(scanDir, prefix) {
   const fileMap = outputFileMap(prefix);
   const included = [];
@@ -512,9 +537,10 @@ function assembleReport(scanDir, prefix) {
       else skipped.push(key);
       continue;
     }
-    const content = fs.readFileSync(full, "utf-8");
+    let content = fs.readFileSync(full, "utf-8");
     const count = content.split("\n").filter((l) => l.trim()).length;
     if (count === 0) { skipped.push(key); continue; }
+    if (key === "nucleiAlerts") content = prettyPrintNucleiJsonl(content);
     included.push({ key, count, content: content.replace(/\s+$/, "") });
   }
   return { fileMap, included, skipped };
@@ -790,6 +816,8 @@ async function handleToolCall(name, args) {
           skip_nuclei: args.skip_nuclei ?? false,
           llm_url: args.llm_url,
           llm_model: args.llm_model,
+          team_name: args.team_name,
+          client_name: args.client_name,
         },
         targets,
       };
@@ -896,6 +924,8 @@ async function handleToolCall(name, args) {
           llm_model: args.llm_model,
           scope: args.scope,
           target_url: args.target_url,
+          team_name: args.team_name,
+          client_name: args.client_name,
         },
       });
     }
@@ -1035,6 +1065,9 @@ async function handleToolCall(name, args) {
         return { content: [{ type: "text", text: `Report exists: ${full} (${stat.size} bytes). Binary docx — use kuromaku_read_file-equivalent file transfer or open directly on host.` }] };
       }
       const lines = fs.readFileSync(full, "utf-8").split("\n").slice(0, maxLines);
+      if (args.file === "nucleiAlerts") {
+        return { content: [{ type: "text", text: prettyPrintNucleiJsonl(lines.join("\n")) || "(no findings)" }] };
+      }
       return { content: [{ type: "text", text: lines.join("\n") }] };
     }
 
@@ -1135,6 +1168,8 @@ function buildPipelineOpts(checkpoint, scanDir) {
     llm_model: checkpoint.options.llm_model,
     scope_file: scopeFile,
     target_url: checkpoint.options.target_url,
+    team_name: checkpoint.options.team_name,
+    client_name: checkpoint.options.client_name,
   };
   return { opts, scope };
 }
@@ -1215,6 +1250,8 @@ async function runBatchTarget(target, batchOptions) {
         skip_nuclei: batchOptions.skip_nuclei ?? false,
         llm_url: batchOptions.llm_url,
         llm_model: batchOptions.llm_model,
+        team_name: batchOptions.team_name,
+        client_name: batchOptions.client_name,
         scope: target.scope,
       },
     });

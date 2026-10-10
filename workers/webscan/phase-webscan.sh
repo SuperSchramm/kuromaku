@@ -238,6 +238,7 @@ run_nuclei_batches() {
       -stats \
       -stats-interval 15 \
       -silent \
+      -jsonl \
       -o "$TARGET_PREFIX-nuclei-batch.log" 2>&1 | \
       sed -u "s/^/ █▄▄▪ [webscan] [nuclei:$batch_label] /" | tee -a "$PROGRESS_LOG"
 

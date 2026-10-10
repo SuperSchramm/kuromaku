@@ -135,6 +135,8 @@ function buildDockerArgs(phase, scanDir, opts) {
   if (phase === "report") {
     if (opts.llm_url) args.push("--llm-url", opts.llm_url);
     if (opts.llm_model) args.push("--llm-model", opts.llm_model);
+    if (opts.team_name) args.push("--team-name", opts.team_name);
+    if (opts.client_name) args.push("--client-name", opts.client_name);
   }
 
   return args;
