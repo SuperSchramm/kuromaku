@@ -77,6 +77,9 @@ kuromaku/
 | `kuromaku_results` | Summary of line counts, or the contents of a single output file |
 | `kuromaku_report` | Full report of every output file that HAS DATA (empties omitted); inline, or `export:true` writes `<prefix>-results-report.md` to the scan volume |
 | `kuromaku_new_project` / `kuromaku_list_projects` | Project housekeeping |
+| `kuromaku_batch_run` | Run a LIST of apex domains, each its own project, strictly sequentially |
+| `kuromaku_batch_status` | Progress across a batch's targets |
+| `kuromaku_batch_pause` | Stop a batch advancing to its next target once the current one finishes |
 
 ### Tool parameters
 
@@ -159,7 +162,37 @@ Concatenates every output file that **has data**, in scan order, one labeled sec
 | `project_name` | string, **required** | Creates the project folder structure without starting a scan. |
 
 #### `kuromaku_list_projects`
-No parameters. Lists all projects and their checkpoint status.
+No parameters. Lists all projects and their checkpoint status, and any batches.
+
+#### `kuromaku_batch_run`
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `batch_id` | string, **required** | — | Identifier for this batch (manifest filename, used by `kuromaku_batch_status`/`kuromaku_batch_pause`). |
+| `targets` | array | — | Inline `{domain, scope?, project_name?}` objects, for a handful. For more than ~15-20, use `targets_file` instead. |
+| `targets_file` | string | — | Filename of a JSON file in `projects/_incoming/` — an array of the same `{domain, scope?, project_name?}` objects. Best for large lists; the whole file is read, nothing truncates. |
+| `threads` / `skip_xss` / `skip_nuclei` / `llm_url` / `llm_model` | — | same as `kuromaku_run` | Applied uniformly to every target. |
+| `force` | boolean | `false` | If `batch_id` already has a manifest, discard it and start fresh from the newly supplied targets. |
+
+Each target becomes an ordinary project — its own checkpoint, its own
+`scope` — run to completion one at a time before the next target starts.
+Nothing else in this server stops two *different* projects' pipelines
+running concurrently (only the *same* project is deduped), so looping
+`kuromaku_run` yourself for a domain list risks stacking N concurrent
+pipelines — the resource-overload scenario nuclei's own batching exists to
+avoid (see `CLAUDE.md`). Use this instead for any multi-domain list.
+
+Calling again with the same `batch_id` resumes it (already-`done` targets
+are skipped) rather than starting over — same semantics as `kuromaku_resume`.
+
+#### `kuromaku_batch_status`
+| Parameter | Type | Description |
+|---|---|---|
+| `batch_id` | string, **required** | Progress summary: done/failed/running/pending counts, the currently-running target's own phase status inline, and a short list of anything not yet done. |
+
+#### `kuromaku_batch_pause`
+| Parameter | Type | Description |
+|---|---|---|
+| `batch_id` | string, **required** | The in-flight target finishes normally; the batch stops before starting the next one. To kill the in-flight target's container immediately instead, use `kuromaku_stop` with that target's own `project_name` (from `kuromaku_batch_status`). Resume with `kuromaku_batch_run` using the same `batch_id`. |
 
 Full setup — Docker image builds, `HOST_PROJECTS_DIR`, LM Studio/Claude
 Desktop `mcp.json` config, resource profile tuning, Windows-specific

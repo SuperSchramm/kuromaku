@@ -23,6 +23,17 @@ structural changes.
 - `workers/<phase>/phase-<phase>.sh` — the actual tool invocations running
   inside each worker container. Domain-mode and CIDR-mode logic live in the
   same script, branched on whether `--cidr` was passed.
+- `kuromaku_batch_run`/`kuromaku_batch_status`/`kuromaku_batch_pause`
+  (`index.js`) — sequences a LIST of apex domains, each as its own ordinary
+  project (own checkpoint, own `scope`), strictly one at a time. Manifest
+  lives at `PROJECTS_DIR/_batches/<batch_id>.json` (`readBatchManifest`/
+  `writeBatchManifest`), separate from per-project `.checkpoint` files —
+  purely a sequencing + progress layer, no changes to `checkpoint.js`/
+  `PHASE_ORDER`/`runPipeline`. Exists because nothing else stops two
+  *different* projects' pipelines running concurrently (`activePipelines`
+  only dedupes the *same* project) — looping `kuromaku_run` yourself for a
+  domain list risks exactly the resource-overload scenario nuclei's own
+  batching below exists to avoid.
 - `workers/report/phase-report.py` — DOCX report generation (python-docx),
   modeled on a reference report format; LLM call for the executive summary
   is optional (falls back to a templated summary if no `llm_url`/`llm_model`

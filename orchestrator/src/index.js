@@ -28,6 +28,11 @@ const PROJECTS_DIR = process.env.PROJECTS_DIR || "/workspace/projects";
 const INCOMING_DIR = path.join(PROJECTS_DIR, "_incoming");
 try { fs.mkdirSync(INCOMING_DIR, { recursive: true }); } catch { /* best effort */ }
 
+// Batch manifests for kuromaku_batch_run — one file per batch, tracking a
+// list of {domain, scope} targets each run as their own ordinary project.
+const BATCHES_DIR = path.join(PROJECTS_DIR, "_batches");
+try { fs.mkdirSync(BATCHES_DIR, { recursive: true }); } catch { /* best effort */ }
+
 // Live detail for kuromaku_status: tail of the progress log, how long since it
 // last changed, and any partial nuclei output — so a long phase is observable
 // without docker logs. Pure file reads; never throws.
@@ -79,6 +84,74 @@ function ensureProjectDirs(projectName) {
     fs.mkdirSync(path.join(base, d), { recursive: true });
   }
   return base;
+}
+
+// ─── Batch manifests (kuromaku_batch_run) ───────────────────────────────────
+// kuromaku_run takes exactly one domain per call. For a list of many apex
+// domains (e.g. a VDP scope table with 68 distinct companies under one
+// program), nothing stops the calling LLM from just issuing kuromaku_run N
+// times itself — except that's also how you accidentally stack N concurrent
+// pipelines, each spawning its own set of worker containers, which is
+// exactly the resource-lockup scenario documented elsewhere in this file
+// (nuclei batching) and in CLAUDE.md. activePipelines only dedupes the SAME
+// project running twice; it does nothing to stop two DIFFERENT projects'
+// pipelines running at once. A batch manifest + strictly sequential
+// execution (one target's full 5-phase pipeline completes before the next
+// target starts) is the fix — everything else (checkpoint, phases, scope
+// filtering, resume, pause) is the existing per-project machinery, reused
+// completely unchanged; the manifest is purely a sequencing + progress layer
+// on top of it.
+function batchManifestPath(batchId) {
+  const safe = String(batchId).replace(/[^a-zA-Z0-9_-]/g, "-");
+  return path.join(BATCHES_DIR, `${safe}.json`);
+}
+
+function readBatchManifest(batchId) {
+  const p = batchManifestPath(batchId);
+  if (!fs.existsSync(p)) return null;
+  return JSON.parse(fs.readFileSync(p, "utf-8"));
+}
+
+function writeBatchManifest(manifest) {
+  manifest.updated_at = new Date().toISOString();
+  const p = batchManifestPath(manifest.batch_id);
+  const tmp = `${p}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(manifest, null, 2));
+  fs.renameSync(tmp, p); // atomic on same filesystem, same pattern as checkpoint.js
+  return manifest;
+}
+
+// Normalize + validate a raw targets array (from `targets` inline or parsed
+// from `targets_file`) into {domain, project_name, scope, status} rows.
+// Returns { targets, errors } — errors are per-row problems (not thrown)
+// so one bad row in a 68-entry list doesn't block the other 67.
+function normalizeBatchTargets(raw) {
+  const targets = [];
+  const errors = [];
+  const seenProjects = new Set();
+  raw.forEach((row, i) => {
+    if (!row || typeof row !== "object" || typeof row.domain !== "string" || !row.domain.trim()) {
+      errors.push(`targets[${i}]: missing/invalid "domain"`);
+      return;
+    }
+    const domain = row.domain.trim();
+    let scope;
+    if (row.scope !== undefined) {
+      if (!Array.isArray(row.scope) || !row.scope.every((s) => typeof s === "string")) {
+        errors.push(`targets[${i}] (${domain}): "scope" must be an array of strings`);
+        return;
+      }
+      scope = row.scope;
+    }
+    const projectName = String(row.project_name || domain).replace(/[^a-zA-Z0-9_-]/g, "-");
+    if (seenProjects.has(projectName)) {
+      errors.push(`targets[${i}] (${domain}): project_name "${projectName}" collides with an earlier row — give it an explicit distinct project_name`);
+      return;
+    }
+    seenProjects.add(projectName);
+    targets.push({ domain, project_name: projectName, scope, status: "pending" });
+  });
+  return { targets, errors };
 }
 
 // ─── Tool definitions ──────────────────────────────────────────────────────
@@ -276,6 +349,87 @@ const TOOL_LIST = [
     name: "kuromaku_list_projects",
     description: "List all projects and their checkpoint status (if any).",
     inputSchema: { type: "object", properties: {} },
+  },
+  {
+    name: "kuromaku_batch_run",
+    description:
+      "Run a LIST of apex domains, each as its own kuromaku_run-equivalent " +
+      "5-phase pipeline (recon -> network -> webscan -> xss -> report), " +
+      "STRICTLY SEQUENTIALLY — one domain's pipeline completes fully before " +
+      "the next one starts. Use this instead of calling kuromaku_run " +
+      "yourself in a loop: issuing many kuromaku_run calls back-to-back " +
+      "stacks concurrent pipelines (nothing else in this server stops two " +
+      "DIFFERENT projects' pipelines running at once — only the SAME " +
+      "project is deduped), which is the same kind of resource overload " +
+      "CLAUDE.md documents nuclei's own 3-way batching exists to avoid. " +
+      "Each target becomes an ordinary project (its own checkpoint, its own " +
+      "scope) — kuromaku_status/kuromaku_results/kuromaku_resume/" +
+      "kuromaku_stop all work on it individually by its project_name once " +
+      "the batch reaches it. Runs in the background; returns immediately. " +
+      "Use kuromaku_batch_status to monitor. If batch_id already has a " +
+      "manifest, this RESUMES it (targets/targets_file are ignored unless " +
+      "force=true) — already-`done` targets are skipped, matching " +
+      "kuromaku_resume's per-project behavior.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        batch_id: { type: "string", description: "Identifier for this batch — used as the manifest filename and for kuromaku_batch_status/kuromaku_batch_pause lookups. Pick something memorable, e.g. the program name." },
+        targets: {
+          type: "array",
+          description: "Inline list for a handful of targets (each a {domain, scope?, project_name?} object). For more than ~15-20, use targets_file instead — a long inline array is the same truncation risk CLAUDE.md documents for kuromaku_ip_scan's `ips` param.",
+          items: {
+            type: "object",
+            properties: {
+              domain: { type: "string", description: "Apex domain for this target, e.g. 'example.com'." },
+              scope: { type: "array", items: { type: "string" }, description: "In-scope glob patterns for THIS target only, same syntax as kuromaku_run's scope param (e.g. ['example.com','*.example.com']). Omit to run this target with no scope filter (same no-scope warning behavior as kuromaku_run)." },
+              project_name: { type: "string", description: "Override the auto-derived project name (sanitized domain) if two targets would otherwise collide." },
+            },
+            required: ["domain"],
+          },
+        },
+        targets_file: { type: "string", description: "BEST for large lists: filename of a JSON file in projects/_incoming/ containing an array of {domain, scope?, project_name?} objects, same shape as `targets`. The orchestrator reads the WHOLE file, so nothing is truncated the way a long inline array can be." },
+        threads: { type: "number", description: "Threads for recon/webscan workers, applied to every target (default 10)", default: 10 },
+        skip_xss: { type: "boolean", default: false },
+        skip_nuclei: { type: "boolean", default: false },
+        llm_url: { type: "string", description: "LM Studio OpenAI-compatible URL for each target's report exec summary" },
+        llm_model: { type: "string", description: "Model name for each target's report exec summary" },
+        force: { type: "boolean", default: false, description: "If batch_id already has a manifest, discard it and start fresh from the newly supplied targets/targets_file instead of resuming." },
+      },
+      required: ["batch_id"],
+    },
+  },
+  {
+    name: "kuromaku_batch_status",
+    description:
+      "Read a batch's manifest and summarize progress: how many targets are " +
+      "done/failed/pending, which one is currently running (with that " +
+      "project's own phase summary inline), and a short list of anything " +
+      "not yet done. Pure file read, like kuromaku_status.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        batch_id: { type: "string" },
+      },
+      required: ["batch_id"],
+    },
+  },
+  {
+    name: "kuromaku_batch_pause",
+    description:
+      "Request a batch stop advancing to its NEXT target once the current " +
+      "one finishes (mirrors kuromaku_pause's gentle semantics — the " +
+      "in-flight target's pipeline is NOT killed). To stop the current " +
+      "target's in-flight container immediately instead, use kuromaku_stop " +
+      "with that target's own project_name (from kuromaku_batch_status). " +
+      "Resume a paused batch by calling kuromaku_batch_run again with the " +
+      "same batch_id.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        batch_id: { type: "string" },
+      },
+      required: ["batch_id"],
+    },
   },
 ];
 
@@ -540,12 +694,168 @@ async function handleToolCall(name, args) {
       if (!cpData) {
         lines.push(`  ${proj} — no scan started`);
       } else {
-        const done = cp.PHASE_ORDER.filter(p => ["done","skipped"].includes(cpData.phases[p].status)).length;
-        const running = cp.PHASE_ORDER.find(p => cpData.phases[p].status === "running");
-        lines.push(`  ${proj} — ${done}/${cp.PHASE_ORDER.length} phases done${running ? ` (running: ${running})` : ""}`);
+        // Mode-aware: a CIDR checkpoint only has network+webscan phases, not
+        // the full 5-phase PHASE_ORDER — indexing it with PHASE_ORDER throws
+        // on the first missing phase (the same class of bug CLAUDE.md flags
+        // for detectStale/summarize; this spot was missed).
+        const order = cpData.mode === "cidr" ? cp.CIDR_PHASE_ORDER : cp.PHASE_ORDER;
+        const done = order.filter(p => ["done","skipped"].includes(cpData.phases[p]?.status)).length;
+        const running = order.find(p => cpData.phases[p]?.status === "running");
+        lines.push(`  ${proj} — ${done}/${order.length} phases done${running ? ` (running: ${running})` : ""}`);
       }
     }
+
+    if (fs.existsSync(BATCHES_DIR)) {
+      const batchFiles = fs.readdirSync(BATCHES_DIR).filter((f) => f.endsWith(".json"));
+      if (batchFiles.length > 0) {
+        lines.push(``, `Batches:`);
+        for (const f of batchFiles) {
+          try {
+            const m = JSON.parse(fs.readFileSync(path.join(BATCHES_DIR, f), "utf-8"));
+            const done = m.targets.filter((t) => ["done","skipped"].includes(t.status)).length;
+            lines.push(`  ${m.batch_id} — ${done}/${m.targets.length} targets done (${m.status})`);
+          } catch { /* skip unreadable manifest */ }
+        }
+      }
+    }
+
     return { content: [{ type: "text", text: lines.join("\n") }] };
+  }
+
+  // ── kuromaku_batch_run ───────────────────────────────────────────────
+  if (name === "kuromaku_batch_run") {
+    if (!args.batch_id) {
+      return { content: [{ type: "text", text: "batch_id is required." }] };
+    }
+
+    let manifest = readBatchManifest(args.batch_id);
+
+    if (manifest && !args.force) {
+      if (manifest.status === "running" || activeBatches.has(args.batch_id)) {
+        return { content: [{ type: "text", text: `Batch '${args.batch_id}' is already running.\n\n${summarizeBatch(manifest)}` }] };
+      }
+      if (manifest.targets.every((t) => ["done", "skipped"].includes(t.status))) {
+        return { content: [{ type: "text", text: `Batch '${args.batch_id}' is already complete.\n\n${summarizeBatch(manifest)}\n\nUse force=true with new targets/targets_file to start over.` }] };
+      }
+      // Resume: ignore targets/targets_file, just clear pause/failed back to
+      // pending so runBatch picks them up, same as kuromaku_resume per-project.
+      manifest.pause_requested = false;
+      for (const t of manifest.targets) {
+        if (t.status === "failed") t.status = "pending";
+      }
+      manifest.status = "running";
+      writeBatchManifest(manifest);
+    } else {
+      // New batch (or force=true overwrite) — need targets from one of the
+      // two sources, same ips/ips_file duality as kuromaku_ip_scan and for
+      // the same reason: a long inline array is a truncation risk.
+      let rawTargets;
+      if (args.targets_file) {
+        const resolved = resolveIpsFile(args.targets_file, BATCHES_DIR);
+        if (!resolved.path) {
+          return { content: [{ type: "text", text:
+            `targets_file '${args.targets_file}' not found. Place it in the staging folder ` +
+            `and pass just its filename. Looked in:\n  ` + resolved.searched.join("\n  ") +
+            `\n\nThe simplest location is ${INCOMING_DIR}/${path.basename(args.targets_file)}.`,
+          }] };
+        }
+        try {
+          rawTargets = JSON.parse(fs.readFileSync(resolved.path, "utf-8"));
+        } catch (e) {
+          return { content: [{ type: "text", text: `targets_file '${resolved.path}' is not valid JSON: ${e.message}` }] };
+        }
+      } else if (Array.isArray(args.targets) && args.targets.length > 0) {
+        rawTargets = args.targets;
+      } else {
+        return { content: [{ type: "text", text: "Provide `targets` (inline array, for a handful) or `targets_file` (a JSON file in projects/_incoming/, best for large lists)." }] };
+      }
+      if (!Array.isArray(rawTargets)) {
+        return { content: [{ type: "text", text: "targets/targets_file must contain a JSON array of {domain, scope?} objects." }] };
+      }
+
+      const { targets, errors } = normalizeBatchTargets(rawTargets);
+      if (targets.length === 0) {
+        return { content: [{ type: "text", text: `No usable targets.\n\nErrors:\n  ${errors.join("\n  ")}` }] };
+      }
+
+      manifest = {
+        batch_id: args.batch_id,
+        created_at: new Date().toISOString(),
+        status: "running",
+        pause_requested: false,
+        current_index: null,
+        options: {
+          threads: args.threads ?? 10,
+          skip_xss: args.skip_xss ?? false,
+          skip_nuclei: args.skip_nuclei ?? false,
+          llm_url: args.llm_url,
+          llm_model: args.llm_model,
+        },
+        targets,
+      };
+      writeBatchManifest(manifest);
+
+      if (errors.length > 0) {
+        // Non-fatal: run what validated, but the caller needs to know some
+        // rows were dropped rather than silently losing them.
+        manifest._rowErrors = errors; // not written to disk below on purpose; surfaced once here
+      }
+    }
+
+    const noScopeCount = manifest.targets.filter((t) => !Array.isArray(t.scope) || t.scope.length === 0).length;
+
+    if (!activeBatches.has(args.batch_id)) {
+      const promise = runBatch(args.batch_id)
+        .catch((e) => console.error(`[orchestrator] batch error for ${args.batch_id}:`, e))
+        .finally(() => activeBatches.delete(args.batch_id));
+      activeBatches.set(args.batch_id, promise);
+    }
+
+    const lines = [
+      `Batch '${args.batch_id}' started — ${manifest.targets.length} target(s), strictly sequential (one target's full pipeline completes before the next starts).`,
+      ``,
+    ];
+    if (manifest._rowErrors) {
+      lines.push(`⚠ ${manifest._rowErrors.length} row(s) dropped (not scanned):`, ...manifest._rowErrors.map((e) => `  ${e}`), ``);
+    }
+    if (noScopeCount > 0) {
+      lines.push(
+        `⚠ ${noScopeCount} of ${manifest.targets.length} target(s) have no 'scope' set — recon's crawl ` +
+        `will pull in third-party domains for those and nothing will filter them before ` +
+        `network/webscan/xss. Worth asking the user to confirm that's intentional for those targets.`,
+        ``,
+      );
+    }
+    lines.push(
+      `Monitor with: kuromaku_batch_status { "batch_id": "${args.batch_id}" }`,
+      `Pause after the current target with: kuromaku_batch_pause { "batch_id": "${args.batch_id}" }`,
+      ``,
+      `⚠ Only scan targets you have explicit written authorization to test.`,
+    );
+    return { content: [{ type: "text", text: lines.join("\n") }] };
+  }
+
+  // ── kuromaku_batch_status ────────────────────────────────────────────
+  if (name === "kuromaku_batch_status") {
+    const manifest = readBatchManifest(args.batch_id);
+    if (!manifest) {
+      return { content: [{ type: "text", text: `No batch found with id '${args.batch_id}'.` }] };
+    }
+    return { content: [{ type: "text", text: summarizeBatch(manifest) }] };
+  }
+
+  // ── kuromaku_batch_pause ─────────────────────────────────────────────
+  if (name === "kuromaku_batch_pause") {
+    const manifest = readBatchManifest(args.batch_id);
+    if (!manifest) {
+      return { content: [{ type: "text", text: `No batch found with id '${args.batch_id}'.` }] };
+    }
+    manifest.pause_requested = true;
+    writeBatchManifest(manifest);
+    return { content: [{ type: "text", text:
+      `Pause requested for batch '${args.batch_id}'. The current target's pipeline will finish normally; ` +
+      `the batch will stop before starting the next one. Resume with kuromaku_batch_run using the same batch_id.`,
+    }] };
   }
 
   // ── kuromaku_run ─────────────────────────────────────────────────────
@@ -804,9 +1114,11 @@ async function handleToolCall(name, args) {
 // current status. The promise is tracked so status calls can report
 // "actively running in this session" and so a duplicate run/resume call
 // doesn't spawn a second pipeline for the same project.
-function startPipeline(projectName, scanDir) {
-  const checkpoint = cp.readCheckpoint(scanDir);
-
+// Shared by startPipeline (fire-and-forget, single kuromaku_run) and
+// runBatchTarget (awaited, one target of a kuromaku_batch_run). Writes the
+// scope file if needed and builds the orch.runPipeline opts object — the
+// one place this mapping happens so the two callers can't drift apart.
+function buildPipelineOpts(checkpoint, scanDir) {
   let scopeFile;
   const scope = checkpoint.options.scope;
   if (Array.isArray(scope) && scope.length > 0) {
@@ -824,6 +1136,12 @@ function startPipeline(projectName, scanDir) {
     scope_file: scopeFile,
     target_url: checkpoint.options.target_url,
   };
+  return { opts, scope };
+}
+
+function startPipeline(projectName, scanDir) {
+  const checkpoint = cp.readCheckpoint(scanDir);
+  const { opts, scope } = buildPipelineOpts(checkpoint, scanDir);
 
   if (!activePipelines.has(projectName)) {
     const promise = orch.runPipeline(scanDir, opts)
@@ -867,6 +1185,145 @@ function startPipeline(projectName, scanDir) {
       ].join("\n"),
     }],
   };
+}
+
+// ─── Batch execution (kuromaku_batch_run) ───────────────────────────────────
+// batch_id -> in-flight runBatch() promise. Same dedup purpose as
+// activePipelines, one level up: prevents double-starting the SAME batch if
+// kuromaku_batch_run is called twice while it's already running.
+const activeBatches = new Map();
+
+// Runs ONE target's full pipeline to completion (awaited — unlike
+// startPipeline, which is fire-and-forget) and reports what happened.
+// Reuses createCheckpoint/buildPipelineOpts/orch.runPipeline exactly as the
+// single-project kuromaku_run path does — a batch target IS an ordinary
+// project in every respect (kuromaku_status/kuromaku_results/kuromaku_stop
+// all work on it individually by project_name), this function just doesn't
+// return until it's actually done, so the batch loop can serialize on it.
+async function runBatchTarget(target, batchOptions) {
+  const scanDir = scanDirFor(target.project_name);
+  ensureProjectDirs(target.project_name);
+  fs.mkdirSync(scanDir, { recursive: true });
+
+  if (!cp.checkpointExists(scanDir)) {
+    cp.createCheckpoint(scanDir, {
+      project: target.project_name,
+      domain: target.domain,
+      options: {
+        threads: batchOptions.threads ?? 10,
+        skip_xss: batchOptions.skip_xss ?? false,
+        skip_nuclei: batchOptions.skip_nuclei ?? false,
+        llm_url: batchOptions.llm_url,
+        llm_model: batchOptions.llm_model,
+        scope: target.scope,
+      },
+    });
+  }
+
+  let checkpoint = cp.readCheckpoint(scanDir);
+  cp.detectStale(scanDir, checkpoint);
+  checkpoint = cp.readCheckpoint(scanDir);
+
+  if (cp.allPhasesDone(checkpoint)) {
+    return { ok: true, alreadyDone: true };
+  }
+
+  const { opts } = buildPipelineOpts(checkpoint, scanDir);
+  await orch.runPipeline(scanDir, opts);
+
+  const finalCheckpoint = cp.readCheckpoint(scanDir);
+  if (cp.allPhasesDone(finalCheckpoint)) {
+    return { ok: true };
+  }
+  const failedPhase = cp.PHASE_ORDER.find((p) => finalCheckpoint.phases[p].status === "failed");
+  return {
+    ok: false,
+    error: failedPhase
+      ? `phase '${failedPhase}' failed: ${finalCheckpoint.phases[failedPhase].error || "see kuromaku_status"}`
+      : "did not complete (see kuromaku_status for this project)",
+  };
+}
+
+// The batch loop: walks manifest.targets in order, running each ONE AT A
+// TIME — this strict serialization (not the per-project phase logic, which
+// is unchanged) is the entire point of this feature. Writes the manifest
+// after every target so progress survives an orchestrator restart and a
+// re-call of kuromaku_batch_run with the same batch_id resumes correctly.
+async function runBatch(batchId) {
+  let manifest = readBatchManifest(batchId);
+  if (!manifest) return;
+
+  for (let i = 0; i < manifest.targets.length; i++) {
+    manifest = readBatchManifest(batchId); // re-read: kuromaku_batch_pause may have touched it
+    const target = manifest.targets[i];
+    if (["done", "skipped"].includes(target.status)) continue;
+    if (manifest.pause_requested) {
+      manifest.status = "paused";
+      writeBatchManifest(manifest);
+      return;
+    }
+
+    target.status = "running";
+    manifest.current_index = i;
+    writeBatchManifest(manifest);
+
+    let result;
+    try {
+      result = await runBatchTarget(target, manifest.options);
+    } catch (e) {
+      result = { ok: false, error: String(e.message || e) };
+    }
+
+    manifest = readBatchManifest(batchId); // re-read in case something else wrote it meanwhile
+    const freshTarget = manifest.targets[i];
+    freshTarget.status = result.ok ? "done" : "failed";
+    if (!result.ok) freshTarget.error = result.error;
+    else delete freshTarget.error;
+    writeBatchManifest(manifest);
+  }
+
+  manifest = readBatchManifest(batchId);
+  manifest.status = manifest.targets.every((t) => ["done", "skipped"].includes(t.status))
+    ? "done"
+    : "done-with-failures";
+  manifest.current_index = null;
+  writeBatchManifest(manifest);
+}
+
+function summarizeBatch(manifest) {
+  const counts = { pending: 0, running: 0, done: 0, failed: 0, skipped: 0 };
+  for (const t of manifest.targets) counts[t.status] = (counts[t.status] || 0) + 1;
+
+  const lines = [
+    `Batch: ${manifest.batch_id}`,
+    `Status: ${manifest.status}${manifest.pause_requested && manifest.status === "running" ? " (pause requested — will stop after current target)" : ""}`,
+    `Targets: ${manifest.targets.length} total — ${counts.done} done, ${counts.failed} failed, ${counts.running} running, ${counts.pending} pending${counts.skipped ? `, ${counts.skipped} skipped` : ""}`,
+    ``,
+  ];
+
+  const running = manifest.targets.find((t) => t.status === "running");
+  if (running) {
+    lines.push(`Currently running: ${running.domain} (project: ${running.project_name})`);
+    const scanDir = scanDirFor(running.project_name);
+    if (cp.checkpointExists(scanDir)) {
+      let checkpoint = cp.readCheckpoint(scanDir);
+      checkpoint = cp.detectStale(scanDir, checkpoint);
+      lines.push(cp.summarize(checkpoint));
+    }
+    lines.push(``);
+  }
+
+  const notDone = manifest.targets.filter((t) => !["done", "skipped"].includes(t.status) && t !== running);
+  if (notDone.length > 0) {
+    lines.push(`Not yet done (${notDone.length}):`);
+    for (const t of notDone.slice(0, 30)) {
+      lines.push(`  ${t.status === "failed" ? "✗" : "○"} ${t.domain} (${t.project_name})${t.error ? ` — ${t.error}` : ""}`);
+    }
+    if (notDone.length > 30) lines.push(`  ... and ${notDone.length - 30} more`);
+  }
+
+  lines.push(``, `Monitor with: kuromaku_batch_status { "batch_id": "${manifest.batch_id}" }`);
+  return lines.join("\n");
 }
 
 // ─── Server factory ─────────────────────────────────────────────────────────
