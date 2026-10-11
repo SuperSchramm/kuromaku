@@ -171,13 +171,61 @@ if [ -z "${domain_list:-}" ]; then
             -o "$tdir/$baseDomain-amass.log"
 
   log "Passing to GAU (Get All URLs)"
-  ## gau requires flags BEFORE the positional domain argument
-  gau \
-    --blacklist "jpg,jpeg,gif,css,tif,tiff,png,ttf,woff,woff2,ico,pdf,svg,txt,js" \
-    --retries 4 \
-    --subs \
-    --o "$tdir/$baseDomain-gau-dirty.log" \
-    "$baseDomain"
+  ## gau is the archive-history source: Wayback/Common Crawl/OTX/URLScan
+  ## surface resources that were once published and may still be reachable
+  ## (forgotten files, retired apps). It is NOT interchangeable with katana,
+  ## which only crawls what is live now.
+  ##
+  ## Providers run ONE AT A TIME. A single combined `gau` call with a stalled
+  ## provider (web.archive.org times out from some networks/VPNs, Common
+  ## Crawl drops the connection) came back with ZERO URLs even though OTX and
+  ## URLScan alone returned ~3,000 for the same domain, and gau hides the
+  ## cause unless --verbose is set. Per-provider runs keep whatever works and
+  ## say plainly what didn't.
+  ## gau requires flags BEFORE the positional domain argument.
+  GAU_PROVIDER_TIMEOUT="${GAU_PROVIDER_TIMEOUT:-300}"   # seconds per provider
+  GAU_RAW="$tdir/$baseDomain-gau-raw.tmp"
+  : > "$GAU_RAW"
+  GAU_FAILED_PROVIDERS=""
+  for provider in wayback commoncrawl otx urlscan; do
+    GAU_ERR="$tdir/$baseDomain-gau-$provider.err"
+    GAU_OUT="$tdir/$baseDomain-gau-$provider.out"
+    ## The archive APIs are flaky (non-200 / dropped connections that succeed
+    ## minutes later — rate limiting), so a provider that returns nothing gets
+    ## one more attempt after a short pause before it is written off.
+    for attempt in 1 2; do
+      timeout "$GAU_PROVIDER_TIMEOUT" gau \
+        --verbose \
+        --providers "$provider" \
+        --blacklist "jpg,jpeg,gif,css,tif,tiff,png,ttf,woff,woff2,ico,pdf,svg,txt,js" \
+        --retries 1 \
+        --timeout 30 \
+        --subs \
+        "$baseDomain" > "$GAU_OUT" 2> "$GAU_ERR"
+      gau_rc=$?
+      n=$(wc -l < "$GAU_OUT" 2>/dev/null || echo 0)
+      [ "$n" -gt 0 ] && break
+      [ "$attempt" -eq 1 ] && { log "gau[$provider]: no results, retrying once"; sleep 15; }
+    done
+    cat "$GAU_OUT" >> "$GAU_RAW"
+    if [ "$gau_rc" -eq 124 ]; then
+      log "gau[$provider]: $n URLs — TIMED OUT after ${GAU_PROVIDER_TIMEOUT}s"
+      GAU_FAILED_PROVIDERS="$GAU_FAILED_PROVIDERS $provider"
+    elif grep -qi 'level=warning\|level=error' "$GAU_ERR" 2>/dev/null; then
+      reason=$(grep -i 'level=warning\|level=error' "$GAU_ERR" | head -1 | sed -E 's/.*msg="([^"]*)".*/\1/' | cut -c1-140)
+      log "gau[$provider]: $n URLs — WARNING: $reason"
+      [ "$n" -eq 0 ] && GAU_FAILED_PROVIDERS="$GAU_FAILED_PROVIDERS $provider"
+    else
+      log "gau[$provider]: $n URLs"
+    fi
+    rm -f "$GAU_ERR" "$GAU_OUT"
+  done
+  if [ -n "$GAU_FAILED_PROVIDERS" ]; then
+    log "WARNING: gau provider(s) returned nothing:$GAU_FAILED_PROVIDERS — archive-history coverage is REDUCED for this target (e.g. web.archive.org may be unreachable from this network)"
+  fi
+  sort -u "$GAU_RAW" | grep -v '^$' > "$tdir/$baseDomain-gau-dirty.log" || : > "$tdir/$baseDomain-gau-dirty.log"
+  rm -f "$GAU_RAW"
+  log "gau: $(wc -l < "$tdir/$baseDomain-gau-dirty.log") unique archive URLs"
 
   ## Extract unique hostnames from gau output and probe with httpx
   if [ -f "$tdir/$baseDomain-gau-dirty.log" ]; then
@@ -200,7 +248,15 @@ if [ -z "${domain_list:-}" ]; then
     -jc \
     -kf all \
     -ef "woff,css,png,svg,jpg,woff2,jpeg,gif,svg" \
-    -o "$tdir/$baseDomain-katana.log" 2>/dev/null || log "katana found no results — continuing"
+    -o "$tdir/$baseDomain-katana.log" 2> "$tdir/$baseDomain-katana.err" || log "katana exited non-zero — continuing"
+  KATANA_N=$(wc -l < "$tdir/$baseDomain-katana.log" 2>/dev/null || echo 0)
+  log "katana: $KATANA_N crawled URL(s)"
+  if [ "$KATANA_N" -le 2 ] && [ -s "$tdir/$baseDomain-katana.err" ]; then
+    log "katana stderr: $(head -c 300 "$tdir/$baseDomain-katana.err" | tr '\n' ' ')"
+  elif [ "$KATANA_N" -le 2 ]; then
+    log "WARNING: katana crawled almost nothing (possibly bot protection/WAF blocking the crawl) — live URL coverage is REDUCED for this target"
+  fi
+  rm -f "$tdir/$baseDomain-katana.err"
 
   ## Carry katana's raw crawled URLs (full URL incl. path/query, not just the
   ## hostname) into gau-dirty.log too. Phase 4 (XSS) builds its candidate list
@@ -210,6 +266,7 @@ if [ -z "${domain_list:-}" ]; then
   ## safe whether or not gau itself produced output.
   touch "$tdir/$baseDomain-gau-dirty.log"
   [ -f "$tdir/$baseDomain-katana.log" ] && cat "$tdir/$baseDomain-katana.log" >> "$tdir/$baseDomain-gau-dirty.log"
+  sort -u -o "$tdir/$baseDomain-gau-dirty.log" "$tdir/$baseDomain-gau-dirty.log"
 
   log "Merging and deduplicating found domains"
   true > "$tdir/$baseDomain-predomains.log"
