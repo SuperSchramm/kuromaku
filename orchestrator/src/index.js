@@ -1381,20 +1381,51 @@ async function runBatch(batchId) {
   writeBatchManifest(manifest);
 }
 
+// One-line "where did this target get to" read from the target's own
+// .checkpoint (the source of truth for phase state — the manifest only
+// tracks per-target status, so nothing is duplicated and nothing can drift).
+function targetProgress(t) {
+  const scanDir = scanDirFor(t.project_name);
+  if (!cp.checkpointExists(scanDir)) return "not started";
+  try {
+    const c = cp.readCheckpoint(scanDir);
+    const order = c.mode === "cidr" ? cp.CIDR_PHASE_ORDER : cp.PHASE_ORDER;
+    const doneN = order.filter((p) => c.phases[p]?.status === "done").length;
+    const next = order.find((p) => c.phases[p]?.status !== "done");
+    if (!next) return `all ${order.length} phases done`;
+    return `${doneN}/${order.length} phases done, resumes at ${next} (${c.phases[next].status})`;
+  } catch {
+    return "checkpoint unreadable";
+  }
+}
+
 function summarizeBatch(manifest) {
   const counts = { pending: 0, running: 0, done: 0, failed: 0, skipped: 0 };
   for (const t of manifest.targets) counts[t.status] = (counts[t.status] || 0) + 1;
 
+  // manifest.status is only what was last written to disk. If it says
+  // "running" but no loop is live in this process (orchestrator restarted or
+  // crashed), nothing is actually executing — say so instead of implying
+  // progress, and point at the resume call.
+  const live = activeBatches.has(manifest.batch_id);
+  let statusText = manifest.status;
+  if (manifest.status === "running" && !live) {
+    statusText = "interrupted — no live batch loop (orchestrator restarted?); nothing is executing. Call kuromaku_batch_run with this batch_id to resume where it left off";
+  } else if (manifest.pause_requested && manifest.status === "running") {
+    statusText += " (pause requested — will stop at the end of the in-flight phase)";
+  }
+
   const lines = [
     `Batch: ${manifest.batch_id}`,
-    `Status: ${manifest.status}${manifest.pause_requested && manifest.status === "running" ? " (pause requested — will stop after current target)" : ""}`,
+    `Status: ${statusText}`,
     `Targets: ${manifest.targets.length} total — ${counts.done} done, ${counts.failed} failed, ${counts.running} running, ${counts.pending} pending${counts.skipped ? `, ${counts.skipped} skipped` : ""}`,
     ``,
   ];
 
   const running = manifest.targets.find((t) => t.status === "running");
   if (running) {
-    lines.push(`Currently running: ${running.domain} (project: ${running.project_name})`);
+    const idx = manifest.targets.indexOf(running) + 1;
+    lines.push(`${live ? "Currently running" : "Was running when interrupted"}: ${running.domain} — target ${idx} of ${manifest.targets.length} (project: ${running.project_name})`);
     const scanDir = scanDirFor(running.project_name);
     if (cp.checkpointExists(scanDir)) {
       let checkpoint = cp.readCheckpoint(scanDir);
@@ -1408,7 +1439,7 @@ function summarizeBatch(manifest) {
   if (notDone.length > 0) {
     lines.push(`Not yet done (${notDone.length}):`);
     for (const t of notDone.slice(0, 30)) {
-      lines.push(`  ${t.status === "failed" ? "✗" : "○"} ${t.domain} (${t.project_name})${t.error ? ` — ${t.error}` : ""}`);
+      lines.push(`  ${t.status === "failed" ? "✗" : "○"} ${t.domain} (${t.project_name}) — ${targetProgress(t)}${t.error ? ` — ${t.error}` : ""}`);
     }
     if (notDone.length > 30) lines.push(`  ... and ${notDone.length - 30} more`);
   }
