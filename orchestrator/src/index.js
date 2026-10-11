@@ -1481,6 +1481,21 @@ if (USE_HTTP) {
       const sessionId = req.headers["mcp-session-id"];
       let transport = sessionId ? transports[sessionId] : null;
 
+      // A session id we don't know (typically: the orchestrator was restarted
+      // or recreated and the client still holds the old id). Sessions are
+      // in-memory only. Per the MCP spec the server must answer 404 so the
+      // client re-initializes; falling through created a fresh transport that
+      // rejected the request with "Server not initialized" (400), which
+      // clients don't treat as "start a new session" — the tool call silently
+      // never ran.
+      if (sessionId && !transport) {
+        return res.status(404).json({
+          jsonrpc: "2.0",
+          error: { code: -32001, message: "Session not found — re-initialize" },
+          id: req.body?.id ?? null,
+        });
+      }
+
       if (!transport) {
         transport = new StreamableHTTPServerTransport({
           sessionIdGenerator: () => crypto.randomUUID(),
