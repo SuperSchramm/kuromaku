@@ -478,7 +478,18 @@ def _set_table_borders(table):
         el.set(qn("w:space"), "0")
         el.set(qn("w:color"), "808080")
         borders.append(el)
-    tbl_pr.append(borders)
+    # CT_TblPr is an ordered sequence: tblBorders must come BEFORE shd,
+    # tblLayout, tblCellMar and tblLook. Appending it after tblLook (what
+    # python-docx leaves at the end) makes Word report unreadable content.
+    successor = None
+    for tag in ("shd", "tblLayout", "tblCellMar", "tblLook", "tblCaption", "tblDescription"):
+        successor = tbl_pr.find(qn(f"w:{tag}"))
+        if successor is not None:
+            break
+    if successor is not None:
+        successor.addprevious(borders)
+    else:
+        tbl_pr.append(borders)
 
 
 def _add_table(document, headers, rows):
