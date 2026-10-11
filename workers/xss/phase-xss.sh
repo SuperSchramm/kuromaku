@@ -58,9 +58,17 @@ GAU_DIRTY="${TARGET_PREFIX}-gau-dirty.log"
 
 log "Phase started"
 
+## dalfox.log holds findings only, but an empty file can't tell "ran, found
+## nothing" from "never ran". '#'-prefixed lines record the attempt; the
+## report and kuromaku_results consumers skip them.
+DALFOX_LOG="$TARGET_PREFIX-dalfox.log"
+note() { echo "# $1" >> "$DALFOX_LOG"; }
+: > "$DALFOX_LOG"
+note "kuromaku xss phase $(date -u +%FT%TZ) target=${baseDomain:-$daBase}"
+
 if [ ! -f "$GAU_DIRTY" ]; then
   log "No gau-dirty.log found (did Phase 1 / recon run first?) — writing empty dalfox.log"
-  touch "$TARGET_PREFIX-dalfox.log"
+  note "outcome: no gau-dirty.log input (recon did not produce URLs)"
   log "Phase complete"
   exit 0
 fi
@@ -68,7 +76,7 @@ fi
 # ─── Build XSS candidate URL list ───────────────────────────────────────────────
 log "Building XSS candidate URL list"
 CANDIDATE_COUNT=$(cat "$GAU_DIRTY" \
-  | qsreplace -a \
+  | qsreplace FUZZ \
   | grep "=" \
   | grep -Eiv "\.(jpg|jpeg|gif|css|tif|tiff|png|ttf|woff|woff2|ico|pdf|svg|txt|js)$" \
   | sort -u \
@@ -76,10 +84,12 @@ CANDIDATE_COUNT=$(cat "$GAU_DIRTY" \
   | wc -l)
 
 log "$CANDIDATE_COUNT candidate URLs with parameters"
+note "input URLs (gau-dirty.log): $(wc -l < "$GAU_DIRTY")"
+note "candidate URLs with parameters (deduped by shape): $CANDIDATE_COUNT"
 
 if [ "$CANDIDATE_COUNT" -eq 0 ]; then
   log "No candidate URLs with parameters — writing empty dalfox.log"
-  touch "$TARGET_PREFIX-dalfox.log"
+  note "outcome: no URLs with query parameters to test; dalfox not run"
   rm -f "$TARGET_PREFIX-xss-candidates.log"
   log "Phase complete"
   exit 0
@@ -98,8 +108,13 @@ log "Checking for reflected parameters via httpx -mr"
 
 MARKER="xssChk$(date +%s)"
 
-## qsreplace -a sets every parameter value to "FUZZ" by default; replace that
-## placeholder with our unique marker so we can grep for it in responses.
+## The candidate list above is normalised with `qsreplace FUZZ` (every
+## parameter value -> FUZZ, which also dedupes URLs by shape); swap that
+## placeholder for our unique marker so we can match it in responses.
+## NOTE: this used to be `qsreplace -a` with no value. With no value -a is a
+## no-op (URLs come out unchanged, no FUZZ anywhere), so the sed below
+## replaced nothing, no marker was ever sent, and httpx -mr reported 0
+## reflections for every URL on every scan.
 cat "$TARGET_PREFIX-xss-candidates.log" \
   | sed "s/FUZZ/${MARKER}/g" \
   | httpx -silent \
@@ -110,10 +125,11 @@ cat "$TARGET_PREFIX-xss-candidates.log" \
 
 REFLECTED_COUNT=$(wc -l < "$TARGET_PREFIX-kxss.log" 2>/dev/null || echo 0)
 log "$REFLECTED_COUNT URLs with reflected marker ('$MARKER')"
+note "httpx reflection check: $REFLECTED_COUNT of $CANDIDATE_COUNT candidates reflected the marker"
 
 if [ "$REFLECTED_COUNT" -eq 0 ]; then
   log "No reflected parameters found — writing empty dalfox.log"
-  touch "$TARGET_PREFIX-dalfox.log"
+  note "outcome: no reflected parameters; dalfox not run"
   rm -f "$TARGET_PREFIX-xss-candidates.log" "$TARGET_PREFIX-kxss.log"
   log "Phase complete"
   exit 0
@@ -137,12 +153,14 @@ cat "$TARGET_PREFIX-kxss.log" \
       --skip-bav \
       --timeout 10 \
       --worker 10 \
-  > "$TARGET_PREFIX-dalfox.log" 2>&1
+  >> "$DALFOX_LOG" 2>&1
 
 kill "$HEARTBEAT_PID" 2>/dev/null
 wait "$HEARTBEAT_PID" 2>/dev/null
 
-XSS_FINDINGS=$(grep -ci "POC\|CONFIRM\|VULN" "$TARGET_PREFIX-dalfox.log" 2>/dev/null || echo 0)
+XSS_FINDINGS=$(grep -v '^#' "$DALFOX_LOG" 2>/dev/null | grep -ci "POC\|CONFIRM\|VULN" || true)
+XSS_FINDINGS=${XSS_FINDINGS:-0}
+note "outcome: dalfox ran against $REFLECTED_COUNT reflected URL(s); $XSS_FINDINGS potential finding(s)"
 log "$XSS_FINDINGS potential XSS findings. Output: $TARGET_PREFIX-dalfox.log"
 
 # Cleanup intermediates

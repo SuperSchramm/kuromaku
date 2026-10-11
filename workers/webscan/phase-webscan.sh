@@ -366,7 +366,7 @@ if [ -n "${cidr_input:-}" ]; then
     DIRSEARCH_TARGETS="$WEB_TARGETS_FILE"
   else
     log "CIDR mode — no web ports found among naabu's open ports, skipping dirsearch"
-    touch "$TARGET_PREFIX-dirsearch.log"
+    echo "# dirsearch skipped: no web ports found among open ports" > "$TARGET_PREFIX-dirsearch.log"
     DIRSEARCH_TARGETS=""
   fi
 else
@@ -375,25 +375,32 @@ else
 fi
 
 if [ -n "$DIRSEARCH_TARGETS" ]; then
-  ## Try modern flag first, fall back to older --output flag if version mismatch
-  dirsearch -l "$DIRSEARCH_TARGETS" \
-    --exclude-status="$returnCodes2Ignore" \
-    -e php,asp,aspx,jsp,html,js,json,xml,conf,config,bak,old,txt \
-    -f \
-    -t "$THREADS" \
-    -o "$TARGET_PREFIX-dirsearch.log" \
-    --format=plain \
-    --quiet 2>/dev/null || \
-  dirsearch -l "$DIRSEARCH_TARGETS" \
-    --exclude-status="$returnCodes2Ignore" \
-    -e php,asp,aspx,jsp,html,js,json,xml,conf,config,bak,old,txt \
-    -f \
-    -t "$THREADS" \
-    --output="$TARGET_PREFIX-dirsearch.log" \
-    --quiet 2>/dev/null || \
-  log "dirsearch flag mismatch — check installed version"
+  ## dirsearch 0.5.0 (what pip installs): output file is -o, the report format
+  ## is -O (there is NO --format flag), and --output is ambiguous between
+  ## --output-file/--output-formats. The previous two-attempt form used
+  ## --format and --output, so BOTH always failed and (with stderr sent to
+  ## /dev/null) dirsearch silently never ran on any scan. stderr is captured
+  ## now so a future flag problem is visible in the progress log instead.
+  DIRSEARCH_ERR="$TARGET_PREFIX-dirsearch.err"
+  if ! dirsearch -l "$DIRSEARCH_TARGETS" \
+      --exclude-status="$returnCodes2Ignore" \
+      -e php,asp,aspx,jsp,html,js,json,xml,conf,config,bak,old,txt \
+      -f \
+      -t "$THREADS" \
+      -o "$TARGET_PREFIX-dirsearch.log" \
+      -O plain \
+      -q >/dev/null 2>"$DIRSEARCH_ERR"; then
+    log "dirsearch exited non-zero: $(head -c 300 "$DIRSEARCH_ERR" | tr '\n' ' ')"
+  elif [ -s "$DIRSEARCH_ERR" ]; then
+    log "dirsearch warnings: $(head -c 300 "$DIRSEARCH_ERR" | tr '\n' ' ')"
+  fi
+  rm -f "$DIRSEARCH_ERR"
 
-  touch "$TARGET_PREFIX-dirsearch.log"
+  # dirsearch writes its own "# Dirsearch started ..." header, so a file with
+  # zero hits is still non-empty. If there's no file at all it did not run.
+  if [ ! -s "$TARGET_PREFIX-dirsearch.log" ]; then
+    echo "# dirsearch produced no output file (did not run or failed — see progress log) $(date -u +%FT%TZ)" > "$TARGET_PREFIX-dirsearch.log"
+  fi
 fi
 log "Output: $TARGET_PREFIX-dirsearch.log"
 

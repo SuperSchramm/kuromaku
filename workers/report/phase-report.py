@@ -434,7 +434,8 @@ def build_templated_report(ctx_paths, args, prefix_name):
     naabu_results = parse_naabu(read_lines(f("naabu.log")))
     nuclei_findings_raw = parse_nuclei_jsonl(read_lines(f("nucleiAlerts.log")))
     dirsearch_results = parse_dirsearch(read_lines(f("dirsearch.log")))
-    dalfox_lines = read_lines(f("dalfox.log"))
+    # '#'-prefixed lines are phase-xss.sh's attempt record, not findings
+    dalfox_lines = [l for l in read_lines(f("dalfox.log")) if not l.lstrip().startswith("#")]
 
     scope_file = os.path.join(args.target_dir, "scope.txt")
     scope_patterns = read_lines(scope_file)
@@ -675,7 +676,8 @@ def build_legacy_report(ctx_paths, args, prefix_name):
     resolved_lines = read_lines(f("resolved.log"))
     nuclei_findings_raw = parse_nuclei_jsonl(read_lines(f("nucleiAlerts.log")))
     dirsearch_results = parse_dirsearch(read_lines(f("dirsearch.log")))
-    dalfox_lines = read_lines(f("dalfox.log"))
+    # '#'-prefixed lines are phase-xss.sh's attempt record, not findings
+    dalfox_lines = [l for l in read_lines(f("dalfox.log")) if not l.lstrip().startswith("#")]
 
     nuclei_by_sev = defaultdict(list)
     for finding in nuclei_findings_raw:
