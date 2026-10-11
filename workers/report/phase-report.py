@@ -422,6 +422,238 @@ def generate_methodology_diagram(out_path):
 
 
 # ─── Templated (docxtpl) report ─────────────────────────────────────────────
+# ─── Assessment-data appendix for the templated report ───────────────────────
+# The CCSO template only has sections for scope, methodology and nuclei
+# findings. Everything else the pipeline collects — hosts, IPs, open ports,
+# nmap service/CVE results, dirsearch, dalfox — was read and counted but never
+# rendered, so reports looked like an empty template. These sections are
+# appended after the template renders, using only styles the template has
+# (Normal, Heading 1-3) and explicit table borders.
+ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]|\[\d+(?:;\d+)*m")
+
+
+def strip_ansi(text):
+    return ANSI_RE.sub("", text)
+
+
+def parse_nmap(lines):
+    """Per-host results from nmap's normal (-oN) output."""
+    hosts = []
+    cur = None
+    for raw in lines:
+        line = raw.rstrip()
+        m = re.match(r"^Nmap scan report for (\S+)(?: \(([\d.:a-fA-F]+)\))?", line)
+        if m:
+            cur = {"host": m.group(1), "ip": m.group(2) or m.group(1),
+                   "timeout": False, "ports": [], "cves": []}
+            hosts.append(cur)
+            continue
+        m = re.match(r"^Skipping host (\S+) .*due to host timeout", line)
+        if m:
+            for h in hosts:
+                if h["host"] == m.group(1):
+                    h["timeout"] = True
+            continue
+        if cur is None:
+            continue
+        m = re.match(r"^(\d+/(?:tcp|udp))\s+(\S+)\s+(\S+)\s*(.*)$", line)
+        if m:
+            cur["ports"].append((m.group(1), m.group(3), m.group(4).strip()))
+            continue
+        for cve in re.findall(r"CVE-\d{4}-\d{4,7}", line):
+            if cve not in cur["cves"]:
+                cur["cves"].append(cve)
+    return hosts
+
+
+def _set_table_borders(table):
+    from docx.oxml import OxmlElement
+    from docx.oxml.ns import qn
+    tbl_pr = table._tbl.tblPr
+    borders = OxmlElement("w:tblBorders")
+    for edge in ("top", "left", "bottom", "right", "insideH", "insideV"):
+        el = OxmlElement(f"w:{edge}")
+        el.set(qn("w:val"), "single")
+        el.set(qn("w:sz"), "4")
+        el.set(qn("w:space"), "0")
+        el.set(qn("w:color"), "808080")
+        borders.append(el)
+    tbl_pr.append(borders)
+
+
+def _add_table(document, headers, rows):
+    table = document.add_table(rows=1, cols=len(headers))
+    _set_table_borders(table)
+    for i, h in enumerate(headers):
+        cell = table.rows[0].cells[i]
+        cell.text = ""
+        cell.paragraphs[0].add_run(h).bold = True
+    for row in rows:
+        cells = table.add_row().cells
+        for i, val in enumerate(row):
+            cells[i].text = str(val)
+    return table
+
+
+def _add_grid(document, items, cols):
+    """Short strings laid out row-wise in `cols` columns (hostnames, IPs)."""
+    rows = [items[i:i + cols] for i in range(0, len(items), cols)]
+    table = document.add_table(rows=0, cols=cols)
+    _set_table_borders(table)
+    for r in rows:
+        cells = table.add_row().cells
+        for i in range(cols):
+            cells[i].text = r[i] if i < len(r) else ""
+    return table
+
+
+def dedupe_paragraph_ids(out_path):
+    """Make every w14:paraId in the body unique.
+
+    docxtpl repeats paragraph/table blocks for each finding; the copies carry
+    the original w14:paraId, so a report with N findings holds N paragraphs
+    with the same id (the source template already has some). Word treats a
+    duplicate paraId as unreadable content and offers to recover the file.
+    """
+    from docx import Document as _Document
+    from docx.oxml import OxmlElement
+    from docx.oxml.ns import qn
+    document = _Document(out_path)
+
+    # Styles without a <w:name>: the CCSO template (a Google Docs export)
+    # carries 14 table styles ("a".."ac") with no name element. Word cannot
+    # register a nameless style, so it opens the file with a "Show Repairs:
+    # Styles" recovery prompt. Give each a unique name; the styleId that
+    # table properties reference is untouched.
+    named = 0
+    for style in document.styles.element.findall(qn("w:style")):
+        if style.find(qn("w:name")) is None:
+            name_el = OxmlElement("w:name")
+            name_el.set(qn("w:val"), f"Kuromaku Table {style.get(qn('w:styleId'))}")
+            style.insert(0, name_el)           # schema order: name comes first
+            named += 1
+
+    attr = "{http://schemas.microsoft.com/office/word/2010/wordml}paraId"
+    seen = set()
+    changed = 0
+    counter = 0x10000000
+    for el in document.element.body.iter():
+        pid = el.get(attr)
+        if pid is None:
+            continue
+        if pid in seen:
+            counter += 1
+            pid = f"{counter:08X}"          # < 0x80000000 as the spec requires
+            el.set(attr, pid)
+            changed += 1
+        seen.add(pid)
+    if changed or named:
+        document.save(out_path)
+    return changed + named
+
+
+def append_assessment_data(out_path, uniqdomains, unique_ips, naabu_results,
+                           nmap_hosts, nmap_raw_lines, dirsearch_raw, dirsearch_results,
+                           dalfox_raw, dalfox_findings):
+    from docx import Document as _Document
+    document = _Document(out_path)
+    cap = 300
+
+    document.add_page_break()
+    document.add_heading("APPENDIX C - SCAN COVERAGE AND RAW RESULTS", level=1)
+    document.add_paragraph(
+        "This appendix lists what the automated pipeline discovered and tested, "
+        "including areas where nothing was found, so that coverage can be reviewed "
+        "alongside the findings above."
+    )
+
+    document.add_heading("C.1 Hostnames in Scope", level=2)
+    if uniqdomains:
+        document.add_paragraph(f"{len(uniqdomains)} unique in-scope hostname(s) were discovered.")
+        _add_grid(document, uniqdomains[:cap], 3)
+        if len(uniqdomains) > cap:
+            document.add_paragraph(f"... and {len(uniqdomains) - cap} more (see uniqdomains.log)")
+    else:
+        document.add_paragraph("No hostnames were recorded for this target.")
+
+    document.add_heading("C.2 Resolved IP Addresses", level=2)
+    if unique_ips:
+        document.add_paragraph(f"{len(unique_ips)} unique IP address(es) resolved.")
+        _add_grid(document, unique_ips[:cap], 4)
+        if len(unique_ips) > cap:
+            document.add_paragraph(f"... and {len(unique_ips) - cap} more (see unique-ips.log)")
+    else:
+        document.add_paragraph("No IP addresses were recorded for this target.")
+
+    document.add_heading("C.3 Open Ports (naabu)", level=2)
+    if naabu_results:
+        document.add_paragraph(f"{len(naabu_results)} open port(s) found across the hosts above.")
+        _add_table(document, ["Host", "Port"], naabu_results[:cap])
+        if len(naabu_results) > cap:
+            document.add_paragraph(f"... and {len(naabu_results) - cap} more (see naabu.log)")
+    else:
+        document.add_paragraph("No open ports were found on the scanned port list.")
+
+    document.add_heading("C.4 Service and Vulnerability Scan (nmap + vulners)", level=2)
+    if nmap_hosts:
+        timed_out = [h for h in nmap_hosts if h["timeout"]]
+        with_services = [h for h in nmap_hosts if h["ports"]]
+        all_cves = sorted({c for h in nmap_hosts for c in h["cves"]})
+        document.add_paragraph(
+            f"{len(nmap_hosts)} host(s) were targeted: {len(with_services)} returned service "
+            f"information, {len(timed_out)} were skipped because they exceeded the per-host "
+            f"timeout and were therefore NOT assessed, and {len(all_cves)} distinct CVE "
+            f"identifier(s) were matched by the vulners script."
+        )
+        rows = []
+        for h in nmap_hosts[:cap]:
+            if h["timeout"]:
+                result = "Skipped (host timeout)"
+            elif h["ports"]:
+                result = "Scanned"
+            else:
+                result = "No open ports in scanned set"
+            services = "; ".join(
+                f"{p} {svc}{' ' + ver if ver else ''}" for p, svc, ver in h["ports"]) or "-"
+            rows.append([h["host"], h["ip"], result, services, ", ".join(h["cves"][:10]) or "-"])
+        _add_table(document, ["Host", "IP", "Result", "Services", "CVEs"], rows)
+    elif nmap_raw_lines:
+        document.add_paragraph("nmap ran but produced no host results.")
+    else:
+        document.add_paragraph("No nmap results were recorded for this target.")
+
+    document.add_heading("C.5 Directory Enumeration (dirsearch)", level=2)
+    ran = any(l.startswith("# Dirsearch started") for l in dirsearch_raw)
+    if dirsearch_results:
+        document.add_paragraph(f"{len(dirsearch_results)} interesting path(s) were found.")
+        _add_table(document, ["Status", "Path"], dirsearch_results[:100])
+    elif ran:
+        document.add_paragraph(
+            "dirsearch ran and found no paths with an interesting status code "
+            "(200, 301, 302, 401, 403).")
+    else:
+        document.add_paragraph(
+            "dirsearch.log contains no run record. The tool may not have executed for "
+            "this scan, so absence of results here should not be read as 'no paths exist'.")
+
+    document.add_heading("C.6 XSS Testing (dalfox)", level=2)
+    record = [l.lstrip("# ").strip() for l in dalfox_raw if l.lstrip().startswith("#")]
+    for l in record:
+        document.add_paragraph(l)
+    if dalfox_findings:
+        document.add_paragraph(f"{len(dalfox_findings)} potential XSS finding line(s):")
+        for l in dalfox_findings[:50]:
+            document.add_paragraph(l)
+    elif not record:
+        document.add_paragraph(
+            "dalfox.log contains no run record. The XSS stage may not have executed "
+            "for this scan.")
+    else:
+        document.add_paragraph("No XSS findings were recorded.")
+
+    document.save(out_path)
+
+
 def build_templated_report(ctx_paths, args, prefix_name):
     if not HAVE_DOCXTPL:
         raise RuntimeError("docxtpl not installed")
@@ -430,12 +662,24 @@ def build_templated_report(ctx_paths, args, prefix_name):
 
     f = ctx_paths
 
-    uniqdomains = read_lines(f("uniqdomains.log"))
+    # uniqdomains.log can hold the same host several times, some lines carrying
+    # httpx status annotations ("host [200] [HSTS]"). Reduce to unique bare
+    # hostnames so the counts and the appendix inventory are accurate.
+    uniqdomains = []
+    for line in read_lines(f("uniqdomains.log")):
+        tokens = strip_ansi(line).split()
+        if tokens and tokens[0] not in uniqdomains:
+            uniqdomains.append(tokens[0])
     naabu_results = parse_naabu(read_lines(f("naabu.log")))
     nuclei_findings_raw = parse_nuclei_jsonl(read_lines(f("nucleiAlerts.log")))
-    dirsearch_results = parse_dirsearch(read_lines(f("dirsearch.log")))
+    dirsearch_raw = read_lines(f("dirsearch.log"))
+    dirsearch_results = parse_dirsearch(dirsearch_raw)
     # '#'-prefixed lines are phase-xss.sh's attempt record, not findings
-    dalfox_lines = [l for l in read_lines(f("dalfox.log")) if not l.lstrip().startswith("#")]
+    dalfox_raw = read_lines(f("dalfox.log"))
+    dalfox_lines = [l for l in dalfox_raw if not l.lstrip().startswith("#")]
+    unique_ips = [strip_ansi(l).strip() for l in read_lines(f("unique-ips.log")) if l.strip()]
+    nmap_raw_lines = read_lines(f("nmapvulners.log"))
+    nmap_hosts = parse_nmap(nmap_raw_lines)
 
     scope_file = os.path.join(args.target_dir, "scope.txt")
     scope_patterns = read_lines(scope_file)
@@ -478,6 +722,19 @@ def build_templated_report(ctx_paths, args, prefix_name):
                 "findings should still be reviewed and remediated where feasible, per the severity "
                 "table above and the detail in the Assessment Findings section below."
             )
+
+    surface = []
+    if uniqdomains:
+        surface.append(f"{len(uniqdomains)} hostname(s)")
+    if unique_ips:
+        surface.append(f"{len(unique_ips)} IP address(es)")
+    if naabu_results:
+        surface.append(f"{len(naabu_results)} open port(s)")
+    if surface:
+        impact_statement += (
+            f" The assessed attack surface comprised {', '.join(surface)}; the full "
+            f"inventory and per-tool results are listed in Appendix C."
+        )
 
     methodology_text = (
         f"{args.team_name}'s testing methodology is an automated pipeline run by Kuromaku, split "
@@ -533,6 +790,21 @@ def build_templated_report(ctx_paths, args, prefix_name):
 
     out_path = f("report.docx")
     doc.save(out_path)
+
+    # Never let post-processing take the report down — the base report is
+    # already complete and saved.
+    try:
+        fixed = dedupe_paragraph_ids(out_path)
+        if fixed:
+            print(f" █▄▄▪ [report] Repaired {fixed} Word-compatibility issue(s) (unnamed styles / repeated paragraph ids)")
+    except Exception as e:
+        print(f" █▄▄▪ [report] paragraph-id cleanup skipped ({e})", file=sys.stderr)
+    try:
+        append_assessment_data(out_path, uniqdomains, unique_ips, naabu_results,
+                               nmap_hosts, nmap_raw_lines, dirsearch_raw,
+                               dirsearch_results, dalfox_raw, dalfox_lines)
+    except Exception as e:
+        print(f" █▄▄▪ [report] Appendix C not added ({e}); base report is intact", file=sys.stderr)
     return out_path
 
 
