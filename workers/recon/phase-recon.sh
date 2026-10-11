@@ -127,19 +127,52 @@ filter_by_scope() {
   [ -z "${SCOPE_FILE:-}" ] && return 0
   [ -f "$infile" ] || return 0
   local tmp="${infile}.scoped"
+  local stats="${infile}.scopestats"
   : > "$tmp"
-  local kept=0 total=0
-  while IFS= read -r line; do
-    [ -z "$line" ] && continue
-    total=$((total + 1))
-    host="$(extract_host "$line")"
-    if in_scope "$host"; then
-      echo "$line" >> "$tmp"
-      kept=$((kept + 1))
-    elif [ -n "$dropfile" ]; then
-      echo "$host" >> "$dropfile"
-    fi
-  done < "$infile"
+  ## ONE awk pass, not a bash loop. The previous per-line loop forked a
+  ## subshell (extract_host) and re-read the scope file for every line; on a
+  ## katana crawl of millions of URLs that is hours of pure CPU. This applies
+  ## exactly the same rules: extract_host's host normalisation, then shell-glob
+  ## match (* and ?) against each scope pattern. Dropped hosts go to $dropfile
+  ## once each (callers sort -u them anyway).
+  awk -v scope="$SCOPE_FILE" -v dropfile="$dropfile" -v statsfile="$stats" '
+    BEGIN {
+      n = 0
+      while ((getline pat < scope) > 0) {
+        sub(/\r$/, "", pat)
+        if (pat == "" || pat ~ /^#/) continue
+        ## glob -> anchored regex, one character at a time (gsub with "&"
+        ## in the replacement is too implementation-specific to trust)
+        out = ""
+        for (j = 1; j <= length(pat); j++) {
+          c = substr(pat, j, 1)
+          if (c == "*") out = out ".*"
+          else if (c == "?") out = out "."
+          else if (index("[](){}.^$+|\\", c) > 0) out = out "\\" c
+          else out = out c
+        }
+        rx[++n] = "^" out "$"
+      }
+      close(scope)
+    }
+    {
+      if ($0 == "") next
+      total++
+      h = $0
+      sub(/^http:\/\//, "", h); sub(/^https:\/\//, "", h)
+      sub(/[[:space:]].*$/, "", h)            # drop httpx metadata
+      sub(/\/.*$/, "", h)                     # drop path
+      sub(/^www\./, "", h)
+      if (h ~ /:/) sub(/:[^:]*$/, "", h)      # drop :port
+      ok = 0
+      for (i = 1; i <= n; i++) if (h ~ rx[i]) { ok = 1; break }
+      if (ok) { print $0; kept++ }
+      else if (dropfile != "" && !(h in seen)) { seen[h] = 1; print h >> dropfile }
+    }
+    END { print kept + 0, total + 0 > statsfile }
+  ' "$infile" > "$tmp"
+  read -r kept total < "$stats" 2>/dev/null || { kept=0; total=0; }
+  rm -f "$stats"
   mv "$tmp" "$infile"
   log "Scope filter on $(basename "$infile"): kept $kept of $total"
 }
@@ -242,15 +275,33 @@ if [ -z "${domain_list:-}" ]; then
 
   log "Passing to Katana (JS-aware crawler)"
   ## katana -d is crawl DEPTH (int), not domain — use -u for URL input
+  ## -ct bounds the crawl. With no limit katana ran for 1h+ on a large
+  ## Next.js site and re-emitted the same URLs over and over (4.1M lines, only
+  ## 51k distinct, 98.8% duplicates — one host cycled through 4 URLs at ~18/s),
+  ## and everything downstream scales with that file. -rl caps requests/sec so
+  ## a crawl loop cannot hammer a single host. Override with
+  ## KATANA_CRAWL_DURATION (e.g. 30m) / KATANA_RATE_LIMIT.
   katana -u "https://$baseDomain" \
     -depth 3 \
+    -ct "${KATANA_CRAWL_DURATION:-15m}" \
+    -rl "${KATANA_RATE_LIMIT:-30}" \
     -silent \
     -jc \
     -kf all \
     -ef "woff,css,png,svg,jpg,woff2,jpeg,gif,svg" \
     -o "$tdir/$baseDomain-katana.log" 2> "$tdir/$baseDomain-katana.err" || log "katana exited non-zero — continuing"
+  ## De-duplicate in place BEFORE anything reads it: a looping crawl can leave
+  ## hundreds of MB of repeats, and every later step (merge, scope filter,
+  ## host extraction, XSS candidate build) would otherwise pay for each one.
+  KATANA_RAW=$(wc -l < "$tdir/$baseDomain-katana.log" 2>/dev/null || echo 0)
+  if [ -s "$tdir/$baseDomain-katana.log" ]; then
+    sort -u -o "$tdir/$baseDomain-katana.log" "$tdir/$baseDomain-katana.log"
+  fi
   KATANA_N=$(wc -l < "$tdir/$baseDomain-katana.log" 2>/dev/null || echo 0)
-  log "katana: $KATANA_N crawled URL(s)"
+  log "katana: $KATANA_N distinct URL(s) ($KATANA_RAW lines emitted)"
+  if [ "$KATANA_RAW" -gt $((KATANA_N * 5)) ] && [ "$KATANA_RAW" -gt 1000 ]; then
+    log "WARNING: katana emitted $KATANA_RAW lines for only $KATANA_N distinct URLs — crawl was looping; de-duplicated"
+  fi
   if [ "$KATANA_N" -le 2 ] && [ -s "$tdir/$baseDomain-katana.err" ]; then
     log "katana stderr: $(head -c 300 "$tdir/$baseDomain-katana.err" | tr '\n' ' ')"
   elif [ "$KATANA_N" -le 2 ]; then
@@ -273,7 +324,9 @@ if [ -z "${domain_list:-}" ]; then
   [ -f "$tdir/$baseDomain-subLister.log" ]  && cat "$tdir/$baseDomain-subLister.log"  >> "$tdir/$baseDomain-predomains.log"
   [ -f "$tdir/$baseDomain-amass.log" ]      && cat "$tdir/$baseDomain-amass.log"      >> "$tdir/$baseDomain-predomains.log"
   [ -f "$tdir/$baseDomain-gau.log" ]        && cat "$tdir/$baseDomain-gau.log"        >> "$tdir/$baseDomain-predomains.log"
-  [ -f "$tdir/$baseDomain-katana.log" ]     && awk -F/ '{print $3}' "$tdir/$baseDomain-katana.log" >> "$tdir/$baseDomain-predomains.log"
+  ## awk '!seen[$0]++' de-duplicates in one pass so a multi-million-line crawl
+  ## contributes only its distinct hostnames to predomains.
+  [ -f "$tdir/$baseDomain-katana.log" ]     && awk -F/ '$3!="" && !seen[$3]++ {print $3}' "$tdir/$baseDomain-katana.log" >> "$tdir/$baseDomain-predomains.log"
 
   ## Explicit seed target (--seed): guarantees it survives into
   ## uniqdomains.log/domains_only.log even if discovery found nothing for it
