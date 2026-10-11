@@ -131,8 +131,11 @@ export function validateOutputs(scanDir, phase, prefix) {
   const present = [];
 
   for (const suffix of required) {
-    // report phase output has no domain prefix (single report.docx)
-    const filename = phase === "report" ? suffix : `${prefix}-${suffix}`;
+    // Every phase's outputs, report included, are written as <prefix>-<suffix>
+    // (phase-report.py's f("report.docx")). An earlier bare "report.docx"
+    // special case here flagged every successful report as missing, which
+    // marked batch targets "failed" despite a good <prefix>-report.docx.
+    const filename = `${prefix}-${suffix}`;
     const full = path.join(scanDir, filename);
     if (fs.existsSync(full) && fs.statSync(full).size >= 0) {
       // size >= 0 allows zero-byte files for phases where "empty" is valid

@@ -524,7 +524,11 @@ def build_templated_report(ctx_paths, args, prefix_name):
             InlineImage(doc, methodology_image_path, width=Mm(180)) if diagram_ok else ""
         ),
     }
-    doc.render(context)
+    # autoescape: values such as the "<CLIENT NAME>" default, nuclei matched
+    # URLs and finding text contain <, > and &. Unescaped, they were written
+    # into word/document.xml as raw tags, nesting paragraphs inside
+    # paragraphs, which Word rejects as a corrupt file.
+    doc.render(context, autoescape=True)
 
     out_path = f("report.docx")
     doc.save(out_path)

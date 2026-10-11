@@ -420,9 +420,11 @@ const TOOL_LIST = [
   {
     name: "kuromaku_batch_pause",
     description:
-      "Request a batch stop advancing to its NEXT target once the current " +
-      "one finishes (mirrors kuromaku_pause's gentle semantics — the " +
-      "in-flight target's pipeline is NOT killed). To stop the current " +
+      "Request a batch stop: the in-flight phase of the current target " +
+      "finishes normally (its container is NOT killed), then the batch " +
+      "halts at that phase boundary, without running the target's remaining " +
+      "phases or starting the next target. Status becomes 'paused' once " +
+      "stopped. To stop the current " +
       "target's in-flight container immediately instead, use kuromaku_stop " +
       "with that target's own project_name (from kuromaku_batch_status). " +
       "Resume a paused batch by calling kuromaku_batch_run again with the " +
@@ -757,7 +759,10 @@ async function handleToolCall(name, args) {
     let manifest = readBatchManifest(args.batch_id);
 
     if (manifest && !args.force) {
-      if (manifest.status === "running" || activeBatches.has(args.batch_id)) {
+      // Only the in-process map proves a batch is live: manifest.status stays
+      // "running" on disk if the orchestrator restarted mid-batch, which
+      // would otherwise wedge the batch as "already running" forever.
+      if (activeBatches.has(args.batch_id)) {
         return { content: [{ type: "text", text: `Batch '${args.batch_id}' is already running.\n\n${summarizeBatch(manifest)}` }] };
       }
       if (manifest.targets.every((t) => ["done", "skipped"].includes(t.status))) {
@@ -880,9 +885,38 @@ async function handleToolCall(name, args) {
     }
     manifest.pause_requested = true;
     writeBatchManifest(manifest);
+
+    // Pausing only between targets can mean waiting hours (a full nuclei pass
+    // per domain), which reads as "pause did nothing". So also set the
+    // running target's own pause_after to its in-flight phase: that phase
+    // finishes normally (container is NOT killed), then the pipeline stops
+    // at the phase boundary instead of running on to the end of the target.
+    let detail = "";
+    const running = manifest.targets.find((t) => t.status === "running");
+    if (running) {
+      const scanDir = scanDirFor(running.project_name);
+      try {
+        if (cp.checkpointExists(scanDir)) {
+          const checkpoint = cp.readCheckpoint(scanDir);
+          const order = checkpoint.mode === "cidr" ? cp.CIDR_PHASE_ORDER : cp.PHASE_ORDER;
+          const inFlight = order.find((p) => checkpoint.phases[p]?.status === "running");
+          if (inFlight && !checkpoint.pause_after) {
+            checkpoint.pause_after = inFlight;
+            checkpoint.pause_by_batch = true;
+            cp.writeCheckpoint(scanDir, checkpoint);
+          }
+          detail = inFlight
+            ? ` The in-flight phase '${inFlight}' of ${running.domain} will finish normally, then the batch stops (the container is not killed).`
+            : ` ${running.domain} is between phases; it will stop before its next phase.`;
+        }
+      } catch (e) {
+        detail = ` (could not set a phase-level pause on ${running.domain}: ${e.message}; the batch will stop after that target finishes instead.)`;
+      }
+    }
     return { content: [{ type: "text", text:
-      `Pause requested for batch '${args.batch_id}'. The current target's pipeline will finish normally; ` +
-      `the batch will stop before starting the next one. Resume with kuromaku_batch_run using the same batch_id.`,
+      `Pause requested for batch '${args.batch_id}'.${detail || " No target is running right now."} ` +
+      `Check kuromaku_batch_status for status "paused". To halt the container immediately, use kuromaku_stop with the target's project_name. ` +
+      `Resume with kuromaku_batch_run using the same batch_id.`,
     }] };
   }
 
@@ -1265,12 +1299,24 @@ async function runBatchTarget(target, batchOptions) {
     return { ok: true, alreadyDone: true };
   }
 
+  // A phase-level pause set by kuromaku_batch_pause is cleared on resume; one
+  // the user set themselves via kuromaku_pause is left alone.
+  if (checkpoint.pause_by_batch) {
+    delete checkpoint.pause_after;
+    delete checkpoint.pause_by_batch;
+    cp.writeCheckpoint(scanDir, checkpoint);
+    checkpoint = cp.readCheckpoint(scanDir);
+  }
+
   const { opts } = buildPipelineOpts(checkpoint, scanDir);
   await orch.runPipeline(scanDir, opts);
 
   const finalCheckpoint = cp.readCheckpoint(scanDir);
   if (cp.allPhasesDone(finalCheckpoint)) {
     return { ok: true };
+  }
+  if (finalCheckpoint.pause_by_batch && finalCheckpoint.pause_after) {
+    return { ok: false, paused: true };
   }
   const failedPhase = cp.PHASE_ORDER.find((p) => finalCheckpoint.phases[p].status === "failed");
   return {
@@ -1313,6 +1359,14 @@ async function runBatch(batchId) {
 
     manifest = readBatchManifest(batchId); // re-read in case something else wrote it meanwhile
     const freshTarget = manifest.targets[i];
+    if (result.paused) {
+      // Stopped at a phase boundary by kuromaku_batch_pause — not a failure.
+      // Back to pending so a resume continues this target from its next phase.
+      freshTarget.status = "pending";
+      manifest.status = "paused";
+      writeBatchManifest(manifest);
+      return;
+    }
     freshTarget.status = result.ok ? "done" : "failed";
     if (!result.ok) freshTarget.error = result.error;
     else delete freshTarget.error;

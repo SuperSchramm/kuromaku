@@ -175,6 +175,41 @@ No parameters. Lists all projects and their checkpoint status, and any batches.
 | `threads` / `skip_xss` / `skip_nuclei` / `llm_url` / `llm_model` | — | same as `kuromaku_run` | Applied uniformly to every target. |
 | `force` | boolean | `false` | If `batch_id` already has a manifest, discard it and start fresh from the newly supplied targets. |
 
+**Targets file format.** `targets_file` is a plain JSON file containing an
+array of objects. Only `domain` is required; `scope` (array of in-scope
+patterns — anything outside is dropped) and `project_name` (defaults to the
+domain; must be unique within the batch) are optional:
+
+```json
+[
+  { "domain": "example.com", "scope": ["example.com", "*.example.com"] },
+  { "domain": "example.org" },
+  { "domain": "shop.example.net", "project_name": "example-net-shop", "scope": ["*.example.net"] }
+]
+```
+
+Save it as `projects/_incoming/<name>.json` (on the host) and pass just the
+filename. The JSON must be valid — no trailing commas, no comments, double
+quotes only. A few targets can skip the file and go inline instead:
+
+```
+kuromaku_batch_run {
+  "batch_id": "my-program",
+  "targets_file": "my_targets.json"
+}
+
+kuromaku_batch_run {
+  "batch_id": "small-batch",
+  "targets": [{ "domain": "example.com", "scope": ["example.com", "*.example.com"] }],
+  "skip_xss": true
+}
+```
+
+Typical workflow: `kuromaku_batch_run` -> `kuromaku_batch_status` to monitor
+-> `kuromaku_batch_pause` to stop -> `kuromaku_batch_run` with the same
+`batch_id` to resume (it ignores `targets`/`targets_file` on a resume; add
+`force: true` with new targets to start over).
+
 Each target becomes an ordinary project — its own checkpoint, its own
 `scope` — run to completion one at a time before the next target starts.
 Nothing else in this server stops two *different* projects' pipelines
@@ -194,7 +229,7 @@ are skipped) rather than starting over — same semantics as `kuromaku_resume`.
 #### `kuromaku_batch_pause`
 | Parameter | Type | Description |
 |---|---|---|
-| `batch_id` | string, **required** | The in-flight target finishes normally; the batch stops before starting the next one. To kill the in-flight target's container immediately instead, use `kuromaku_stop` with that target's own `project_name` (from `kuromaku_batch_status`). Resume with `kuromaku_batch_run` using the same `batch_id`. |
+| `batch_id` | string, **required** | The in-flight *phase* finishes normally (its container is not killed), then the batch stops — it does not continue through the target's remaining phases or on to the next target. Expect the batch to keep running until that phase ends (a nuclei pass can take a long while); `kuromaku_batch_status` shows `paused` once it has stopped. To kill the in-flight target's container immediately instead, use `kuromaku_stop` with that target's own `project_name` (from `kuromaku_batch_status`). Resume with `kuromaku_batch_run` using the same `batch_id`. |
 
 Full setup — Docker image builds, `HOST_PROJECTS_DIR`, LM Studio/Claude
 Desktop `mcp.json` config, resource profile tuning, Windows-specific
