@@ -76,7 +76,11 @@ log() {
 }
 
 ## Status codes excluded from dirsearch results
-returnCodes2Ignore="301,302,303,304,307,400,404,429,500,501,502,503,504"
+## 429 (rate-limited) is deliberately NOT excluded: a host throttling every
+## request is itself worth seeing in the report, and excluding it made a
+## throttled/WAF-protected host indistinguishable from a genuine hang during
+## its full wordlist run (confirmed live against aegeanair.com — see git log).
+returnCodes2Ignore="301,302,303,304,307,400,404,500,501,502,503,504"
 
 # ─── Resolve prefix and input files ────────────────────────────────────────────
 if [ -n "${cidr_input:-}" ]; then
@@ -382,18 +386,41 @@ if [ -n "$DIRSEARCH_TARGETS" ]; then
   ## /dev/null) dirsearch silently never ran on any scan. stderr is captured
   ## now so a future flag problem is visible in the progress log instead.
   DIRSEARCH_ERR="$TARGET_PREFIX-dirsearch.err"
-  if ! dirsearch -l "$DIRSEARCH_TARGETS" \
+  DIRSEARCH_TARGET_COUNT=$(wc -l < "$DIRSEARCH_TARGETS" 2>/dev/null || echo 0)
+
+  dirsearch -l "$DIRSEARCH_TARGETS" \
       --exclude-status="$returnCodes2Ignore" \
       -e php,asp,aspx,jsp,html,js,json,xml,conf,config,bak,old,txt \
       -f \
       -t "$THREADS" \
       -o "$TARGET_PREFIX-dirsearch.log" \
       -O plain \
-      -q >/dev/null 2>"$DIRSEARCH_ERR"; then
+      -q >/dev/null 2>"$DIRSEARCH_ERR" &
+  DIRSEARCH_PID=$!
+
+  # dirsearch runs -q (quiet) and --exclude-status drops common noise
+  # (404/429/etc), so a host that returns only excluded statuses produces
+  # ZERO log lines for as long as it takes to grind through that host's
+  # full wordlist x extensions -- indistinguishable from a hang with no
+  # other signal. Log a heartbeat (still-alive + hit count so far) every
+  # 2 minutes so "no new lines" can be told apart from "actually stuck."
+  (
+    while kill -0 "$DIRSEARCH_PID" 2>/dev/null; do
+      sleep 120
+      kill -0 "$DIRSEARCH_PID" 2>/dev/null || break
+      hits=$(wc -l < "$TARGET_PREFIX-dirsearch.log" 2>/dev/null || echo 0)
+      log "dirsearch heartbeat: still running, $hits hit(s) logged so far across $DIRSEARCH_TARGET_COUNT target(s) (silence is expected while a host returns only excluded statuses, e.g. 404/429)"
+    done
+  ) &
+  HEARTBEAT_PID=$!
+
+  if ! wait "$DIRSEARCH_PID"; then
     log "dirsearch exited non-zero: $(head -c 300 "$DIRSEARCH_ERR" | tr '\n' ' ')"
   elif [ -s "$DIRSEARCH_ERR" ]; then
     log "dirsearch warnings: $(head -c 300 "$DIRSEARCH_ERR" | tr '\n' ' ')"
   fi
+  kill "$HEARTBEAT_PID" 2>/dev/null
+  wait "$HEARTBEAT_PID" 2>/dev/null
   rm -f "$DIRSEARCH_ERR"
 
   # dirsearch writes its own "# Dirsearch started ..." header, so a file with
