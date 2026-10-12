@@ -388,8 +388,26 @@ if [ -n "$DIRSEARCH_TARGETS" ]; then
   DIRSEARCH_ERR="$TARGET_PREFIX-dirsearch.err"
   DIRSEARCH_TARGET_COUNT=$(wc -l < "$DIRSEARCH_TARGETS" 2>/dev/null || echo 0)
 
+  ## --auto-calibration: a host that blanket-returns one status (e.g. 403
+  ## for every nonexistent path, common behind a WAF) isn't excluded by
+  ## --exclude-status unless that exact code is listed, so it floods the
+  ## log with one "hit" per wordlist entry -- confirmed live: a single such
+  ## host logged 50,000+ lines that were all false positives, not findings.
+  ## This forces dirsearch's own wildcard calibration from the start of
+  ## every host so those get filtered instead of reported as hits.
+  ##
+  ## --exclude-text: confirmed live that auto-calibration alone did NOT
+  ## catch an Akamai host that started hard-blocking the scan (403 on every
+  ## path, including a made-up one) partway through -- calibration runs
+  ## once at host start, before the block kicked in, and the deny page
+  ## embeds the requested path + a reference ID so its size/content differ
+  ## per request just enough to dodge a naive wildcard match. The deny
+  ## page's boilerplate phrase is stable across requests, so matching on it
+  ## directly suppresses the flood regardless of when the block started.
   dirsearch -l "$DIRSEARCH_TARGETS" \
       --exclude-status="$returnCodes2Ignore" \
+      --auto-calibration \
+      --exclude-text="you don't have permission to access" \
       -e php,asp,aspx,jsp,html,js,json,xml,conf,config,bak,old,txt \
       -f \
       -t "$THREADS" \
