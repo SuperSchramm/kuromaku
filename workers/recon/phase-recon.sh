@@ -354,8 +354,20 @@ if [ -z "${domain_list:-}" ]; then
     log "$(wc -l < "$OUT_OF_SCOPE_FILE") out-of-scope host(s) dropped — see $(basename "$OUT_OF_SCOPE_FILE")"
   fi
 
-  ## Normalize: strip scheme, www, ports, paths, whitespace
+  ## Normalize: strip scheme, httpx metadata, www, ports, paths, whitespace.
+  ## The metadata strip (drop everything from the first whitespace) MUST run
+  ## before the port/path strips below, and before this file is used anywhere:
+  ## subLister.log carries httpx's "-title -tech-detect -status-code"
+  ## annotations (e.g. "host [403] [title] [Nginx,HTTP/2]"). A tech tag
+  ## containing "/" (HTTP/2, HTTP/3) made the old 's|/.*||g' chop at that
+  ## inner slash instead of a real path, leaving an unbalanced "[" in
+  ## uniqdomains.log. dirsearch -l then crashed (ValueError: Invalid IPv6
+  ## URL) on that single line and took the whole run down; nuclei -l (also
+  ## fed this file) silently mis-targeted the annotated lines the same way.
+  ## uniqdomains.log must stay bare hostnames only — it is dirsearch's and
+  ## nuclei's target list, not just a human-readable summary.
   sed -E 's|^\s*https?://||g' "$tdir/$baseDomain-predomains.log" \
+    | sed -E 's/[[:space:]].*$//' \
     | sed 's|www\.||g' \
     | sed 's|:80$||g; s|:443$||g' \
     | sed 's|/.*||g' \
@@ -393,6 +405,19 @@ else
         -timeout 10 -threads "$THREADS" \
         -title -tech-detect -status-code \
         -o "$tdir/$daBase-uniqdomains.log"
+
+  ## Same normalization as the single-domain branch above: this file is fed
+  ## to dirsearch -l and nuclei -l downstream, so the httpx title/tech/status
+  ## annotations (which can themselves contain "/", e.g. "HTTP/2") must not
+  ## survive into it — see the comment at the other call site.
+  sed -E 's|^\s*https?://||g' "$tdir/$daBase-uniqdomains.log" \
+    | sed -E 's/[[:space:]].*$//' \
+    | sed 's|www\.||g' \
+    | sed 's|:80$||g; s|:443$||g' \
+    | sed 's|/.*||g' \
+    | sed '/^$/d' \
+    | sort -u > "$tdir/$daBase-uniqdomains.log.tmp"
+  mv "$tdir/$daBase-uniqdomains.log.tmp" "$tdir/$daBase-uniqdomains.log"
 
   domainCOUNT=$(wc -l < "$tdir/$daBase-uniqdomains.log")
 
